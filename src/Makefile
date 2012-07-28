@@ -33,6 +33,7 @@ MODULES=yaws \
 	yaws_cgi \
 	yaws_zlib \
 	yaws_generated \
+	mime_type_c \
 	mime_types \
 	yaws_session_server \
 	yaws_outmod \
@@ -56,6 +57,7 @@ MODULES=yaws \
 	yaws_shaper \
 	yaws_dime \
 	yaws_exhtml \
+	yaws_sse \
 	$(BITSMODS)
 
 
@@ -82,8 +84,8 @@ yaws_generated.erl:	yaws_generated.template ../vsn.mk
 	    ../scripts/gen-yaws-generated true > yaws_generated.erl
 
 yaws_configure.hrl:	 ../vsn.mk ../include.mk
-	if [  $(HAVE_SENDFILE) = "true" ]; then \
-		echo "-define(HAVE_SENDFILE, true)." > yaws_configure.hrl; \
+	if [  $(HAVE_YAWS_SENDFILE) = "true" ]; then \
+		echo "-define(HAVE_YAWS_SENDFILE, true)." > yaws_configure.hrl; \
 	else touch yaws_configure.hrl; fi
 
 
@@ -96,31 +98,32 @@ regen:
 
 charset.def:
 	if [ -n "$(DEFAULT_CHARSET)" ]; then \
-           echo $(DEFAULT_CHARSET) > charset.def; \
-	else rm -f charset.def ; touch charset.def; fi
+           echo $(DEFAULT_CHARSET) > ../priv/charset.def; \
+	else rm -f ../priv/charset.def ; touch ../priv/charset.def; fi
 
 mime_type_c.beam: mime_type_c.erl
 
-mime_types.erl:	mime.types charset.def mime_type_c.beam
-	$(ERL) -noshell -pa ../ebin -s mime_type_c compile
+mime_types.erl: charset.def mime_type_c.beam
+	$(ERL) -noshell -pa ../ebin -s mime_type_c generate
 
 debug:
 	$(MAKE) TYPE=debug
 
 clean:
-	rm -f $(EBIN_FILES) yaws_generated.erl charset.def \
-		mime_types.erl yaws_configure.hrl mime_type_c.beam
+	rm -f $(EBIN_FILES) yaws_generated.erl yaws_configure.hrl \
+		mime_types.erl ../priv/charset.def
 
 install: regen all docsinstall
-	$(INSTALL) -d $(DESTDIR)$(PREFIX)/lib/yaws/examples/ebin
-	$(INSTALL) -d $(DESTDIR)$(PREFIX)/lib/yaws/examples/include
-	$(INSTALL) -d $(DESTDIR)$(PREFIX)/lib/yaws/ebin
-	$(INSTALL) -d $(DESTDIR)$(PREFIX)/lib/yaws/priv
+	$(INSTALL) -d $(DESTDIR)$(LIBDIR)/yaws/examples/ebin
+	$(INSTALL) -d $(DESTDIR)$(LIBDIR)/yaws/examples/include
+	$(INSTALL) -d $(DESTDIR)$(LIBDIR)/yaws/ebin
+	$(INSTALL) -d $(DESTDIR)$(LIBDIR)/yaws/priv
 	$(INSTALL) -d $(DESTDIR)$(VARDIR)/log/yaws
 	$(INSTALL) -d $(DESTDIR)$(VARDIR)/yaws/ebin
-	(cd ..; tar cf - ebin ) | (cd $(DESTDIR)$(PREFIX)/lib/yaws; tar xf - )
-	(cd ..; tar cf - include ) | (cd $(DESTDIR)$(PREFIX)/lib/yaws; tar xf - )
-	(cd ..; tar cf - priv/*.xsd ) | (cd $(DESTDIR)$(PREFIX)/lib/yaws; tar xf - )
+	(cd ..; tar cf - ebin ) | (cd $(DESTDIR)$(LIBDIR)/yaws; tar xf - )
+	(cd ..; tar cf - include ) | (cd $(DESTDIR)$(LIBDIR)/yaws; tar xf - )
+	(cd ..; tar cf - priv/*.xsd ) | (cd $(DESTDIR)$(LIBDIR)/yaws; tar xf - )
+	$(INSTALL) -m 644 ../priv/mime.types  $(DESTDIR)$(LIBDIR)/yaws/priv
 
 docsinstall:
 	$(INSTALL) -d $(DESTDIR)$(VARDIR)/yaws/www

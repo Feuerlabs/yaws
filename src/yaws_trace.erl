@@ -139,12 +139,13 @@ set_filter(Filter) ->
                    {ok, E} -> E;
                    _       -> throw({error, {invalid_filter, parse_failed}})
                end,
-    Result = case erl_eval:exprs(ExprList, []) of
-                 {value, R, _} -> R;
-                 _             -> throw({error, {invalid_filter, eval_failed}})
-             end,
-    gen_server:call(?MODULE, {set_filter, Result}, infinity).
-
+    try erl_eval:exprs(ExprList, []) of
+        {value, Result, _} ->
+            gen_server:call(?MODULE, {set_filter, Result}, infinity)
+    catch
+        _:_ ->
+            throw({error, {invalid_filter, eval_failed}})
+    end.
 
 unset_filter() ->
     gen_server:call(?MODULE, unset_filter, infinity).
@@ -476,7 +477,7 @@ get_header_value(authorization, Headers) ->
         {User, Pass, Orig}           -> lists:flatten([User,":",Pass,":",Orig])
     end;
 get_header_value(transfer_encoding, Headers) ->
-    case yaws_api:headers_encoding(Headers) of
+    case yaws_api:headers_transfer_encoding(Headers) of
         undefined -> [];
         Value     -> Value
     end;

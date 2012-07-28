@@ -13,7 +13,7 @@ local_install:	../bin/yaws
 	VARDIR="${HOME}/var" ./local-install true
 
 yaws.conf:
-	YAWSDIR='$(PREFIX)/lib/yaws' LOGDIR='$(PREFIX)/var/log/yaws' \
+	YAWSDIR='$(LIBDIR)/yaws' LOGDIR='$(PREFIX)/var/log/yaws' \
 	VARDIR='$(VARDIR)' PORT=80 DOCROOT='$(VARDIR)/yaws/www' \
 	CERTDIR='$(ETCDIR)/yaws' SSLPORT=443 ./gen-yaws-conf > $@
 
@@ -24,5 +24,5 @@ install:	.install
 
 .install:
 	PREFIX='$(PREFIX)' ETCDIR='$(ETCDIR)' VARDIR='$(VARDIR)' \
-	ERLBINDIR='$(ERLBINDIR)' DESTDIR='$(DESTDIR)' \
+	ERLBINDIR='$(ERLBINDIR)' DESTDIR='$(DESTDIR)' LIBDIR='$(LIBDIR)' \
 	ERL='$(subst ",,$(ERL))' WERL='$(subst ",,$(WERL))' ./regular-install

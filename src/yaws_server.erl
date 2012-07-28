@@ -14,7 +14,6 @@
 -include("yaws_debug.hrl").
 
 -include_lib("kernel/include/file.hrl").
--include_lib("kernel/include/inet.hrl").
 
 -export([mappath/3, vdirpath/3]).
 
@@ -35,7 +34,8 @@
 
 %% internal exports
 -export([gserv/3,acceptor0/2, load_and_run/2, done_or_continue/0,
-         accumulate_content/1, deliver_accumulated/5, setup_dirs/1,
+         accumulate_content/1, deliver_accumulated/4, deliver_accumulated/1,
+         setup_dirs/1,
          deliver_dyn_part/8, finish_up_dyn_file/2, gserv_loop/4
         ]).
 
@@ -121,7 +121,7 @@ l2a(A) when is_atom(A) -> A.
 
 init(Env) -> %% #env{Trace, TraceOut, Conf, RunMod, Embedded, Id}) ->
     process_flag(trap_exit, true),
-    put(start_time, calendar:local_time ()),  %% for uptime
+    put(start_time, calendar:local_time()),  %% for uptime
     case Env#env.embedded of
         false ->
             Config = (catch yaws_config:load(Env)),
@@ -178,11 +178,10 @@ init2(GC, Sconfs, RunMod, Embedded, FirstTime) ->
         _ ->
             ok
     end,
-    foreach(
-      fun(D) ->
-              yaws_debug:format("Add path ~p~n", [D]),
-              code:add_pathz(D)
-      end, GC#gconf.ebin_dir),
+    foreach(fun(D) ->
+                    yaws_debug:format("Add path ~p~n", [D]),
+                    code:add_pathz(D)
+            end, GC#gconf.ebin_dir),
     yaws_debug:format("Running with id=~p (localinstall=~p) ~n"
                       "~s"
                       "Logging to directory ~p~n",
@@ -213,13 +212,11 @@ init2(GC, Sconfs, RunMod, Embedded, FirstTime) ->
     end,
 
     runmod(RunMod, GC),
-
-    L2 = lists:zf(
-           fun(Group) -> start_group(GC, Group) end,
-           Sconfs),
-    {ok, #state{gc = GC,
-                pairs = L2,
-                mnum = 0,
+    L2 = lists:zf(fun(Group) -> start_group(GC, Group) end,
+                  yaws_config:load_mime_types_module(GC, Sconfs)),
+    {ok, #state{gc       = GC,
+                pairs    = L2,
+                mnum     = 0,
                 embedded = Embedded}}.
 
 
@@ -522,7 +519,7 @@ gserv(Top, GC, Group0) ->
 setup_dirs(GC) ->
     Dir = yaws:id_dir(GC#gconf.id),
     Ctl = yaws:ctl_file(GC#gconf.id),
-    filelib:ensure_dir(Ctl),
+    ok = filelib:ensure_dir(Ctl),
     case file:list_dir(Dir) of
         {ok, LL} ->
             foreach(
@@ -865,15 +862,18 @@ listen_opts(SC) ->
                    true ->
                        []
                end,
-    [binary,
+    Opts = [binary,
      {ip, SC#sconf.listen},
      {packet, http},
      {packet_size, 16#4000},
      {recbuf, 8192},
      {reuseaddr, true},
+     {backlog, 1024},
      {active, false}
      | proplists:get_value(listen_opts, SC#sconf.soptions, [])
-    ] ++ InetType.
+    ] ++ InetType,
+    ?Debug("listen options: ~p", [Opts]),
+    Opts.
 
 ssl_listen_opts(GC, SC, SSL) ->
     InetType = if
@@ -1124,6 +1124,13 @@ aloop(CliSock, {IP,Port}, GS, Num) ->
     process_flag(trap_exit, true),
     ?Debug("Head = ~p~n", [Head]),
     case Head of
+        {error, {too_many_headers, ReqTooMany}} ->
+            %% RFC 6585 status code 431
+            ?Debug("Request headers too large~n", []),
+            SC = pick_sconf(GS#gs.gconf, #headers{}, GS#gs.group),
+            put(sc, SC),
+            put(outh, #outh{}),
+            deliver_431(CliSock, ReqTooMany);
         {Req0, H0} when Req0#http_request.method /= bad_request ->
             {Req, H} = fix_abs_uri(Req0, H0),
             ?Debug("{Req, H} = ~p~n", [{Req, H}]),
@@ -1381,21 +1388,11 @@ maybe_auth_log(Item, ARG) ->
     end.
 
 maybe_access_log(Ip, Req, H) ->
-    GC=get(gc),
     SC=get(sc),
     case ?sc_has_access_log(SC) of
         true ->
-            HName = case ?gc_log_has_resolve_hostname(GC) of
-                        true when Ip =/= unknown ->
-                            case inet:gethostbyaddr(Ip) of
-                                {ok, HE} -> HE#hostent.h_name;
-                                _        -> Ip
-                            end;
-                        _ ->
-                            Ip
-                    end,
             Time = timer:now_diff(now(), get(request_start_time)),
-            yaws_log:accesslog(SC, HName, Req, H, get(outh), Time);
+            yaws_log:accesslog(SC, Ip, Req, H, get(outh), Time);
         false ->
             ignore
     end.
@@ -1513,17 +1510,19 @@ body_method(CliSock, IPPort, Req, Head) ->
     SC=get(sc),
     ok = yaws:setopts(CliSock, [{packet, raw}, binary], yaws:is_ssl(SC)),
     PPS = SC#sconf.partial_post_size,
-    Bin = case Head#headers.content_length of
+    Res = case Head#headers.content_length of
               undefined ->
                   case Head#headers.transfer_encoding of
                       "chunked" ->
                           get_chunked_client_data(CliSock, yaws:is_ssl(SC));
                       _ ->
                           <<>>
-                              end;
+                  end;
               Len when is_integer(PPS) ->
                   Int_len = list_to_integer(Len),
                   if
+                      Int_len < 0 ->
+                          {error, content_length_overflow};
                       Int_len == 0 ->
                           <<>>;
                       PPS < Int_len ->
@@ -1536,6 +1535,8 @@ body_method(CliSock, IPPort, Req, Head) ->
               Len when PPS == nolimit ->
                   Int_len = list_to_integer(Len),
                   if
+                      Int_len < 0 ->
+                          {error, content_length_overflow};
                       Int_len == 0 ->
                           <<>>;
                       true ->
@@ -1543,9 +1544,15 @@ body_method(CliSock, IPPort, Req, Head) ->
                                           yaws:is_ssl(SC))
                   end
           end,
-    ?Debug("Request data = ~s~n", [binary_to_list(un_partial(Bin))]),
-    ARG = make_arg(CliSock, IPPort, Head, Req, Bin),
-    handle_request(CliSock, ARG, size(un_partial(Bin))).
+    case Res of
+        {error, Reason} ->
+            error_logger:format("Invalid Request: ~p~n", [Reason]),
+            deliver_400(CliSock, Req);
+        Bin ->
+            ?Debug("Request data = ~s~n", [binary_to_list(un_partial(Bin))]),
+            ARG = make_arg(CliSock, IPPort, Head, Req, Bin),
+            handle_request(CliSock, ARG, size(un_partial(Bin)))
+    end.
 
 
 'MKCOL'(CliSock, IPPort, Req, Head) ->
@@ -1560,8 +1567,14 @@ no_body_method(CliSock, IPPort, Req, Head) ->
     handle_request(CliSock, ARG, 0).
 
 
-make_arg(CliSock, IPPort, Head, Req, Bin) ->
+make_arg(CliSock0, IPPort, Head, Req, Bin) ->
     SC = get(sc),
+    CliSock = case yaws:is_ssl(SC) of
+                  nossl ->
+                      CliSock0;
+                  ssl ->
+                      {ssl, CliSock0}
+              end,
     ARG = #arg{clisock = CliSock,
                client_ip_port = IPPort,
                headers = Head,
@@ -1620,11 +1633,14 @@ handle_request(CliSock, ARG, _N)
         _ ->
             %% Define a default content type if needed
             case yaws:outh_get_content_type() of
-                undefined -> yaws:outh_set_content_type("text/plain");
-                _         -> ok
+                undefined ->
+                    Mime = mime_types:default_type(get(sc)),
+                    yaws:outh_set_content_type(Mime);
+                _ ->
+                    ok
             end,
             accumulate_content(State#rewrite_response.content),
-            deliver_accumulated(ARG, CliSock, decide, undefined, final)
+            deliver_accumulated(ARG, CliSock, undefined, final)
     end,
     done_or_continue();
 
@@ -1817,7 +1833,7 @@ is_auth(ARG, L) ->
         {_, Auths} ->
             is_auth(ARG, Req_dir, H, filter_auths(Auths, Req_dir), {true, []});
         false ->
-            {true, []}
+            true
     end.
 
 %% Either no authentication was done or all methods returned false
@@ -1992,27 +2008,31 @@ is_revproxy(ARG, Path, SC = #sconf{revproxy = RevConf}) ->
         {false, _} ->
             is_revproxy1(Path, RevConf);
         {true, _} ->
-            {true, {"/", fwdproxy_url(ARG)}}
+            {true, #proxy_cfg{prefix="/", url=fwdproxy_url(ARG)}}
     end.
 
 is_revproxy1(_,[]) ->
     false;
-is_revproxy1(Path, [{Prefix, URL} | Tail]) ->
-    case yaws:is_prefix(Prefix, Path) of
-        {true,_} ->
-            {true, {Prefix,URL}};
+is_revproxy1(Path, RevConf) ->
+    case lists:keyfind(Path, #proxy_cfg.prefix, RevConf) of
+        #proxy_cfg{}=R ->
+            {true, R};
+        false when Path == "/" ->
+            false;
         false ->
-            is_revproxy1(Path, Tail)
+            is_revproxy1(filename:dirname(Path), RevConf)
     end.
 
 is_redirect_map(_, []) ->
     false;
-is_redirect_map(Path, [E={Prefix, _URL, _AppendMode}|Tail]) ->
-    case yaws:is_prefix(Prefix, Path) of
-        {true, _} ->
+is_redirect_map(Path, RedirMap) ->
+    case lists:keyfind(Path, 1, RedirMap) of
+        {Path, _Url, _AppendMod}=E ->
             {true, E};
+        false when Path == "/" ->
+            false;
         false ->
-            is_redirect_map(Path, Tail)
+            is_redirect_map(filename:dirname(Path), RedirMap)
     end.
 
 %% Find out what which module to call when urltype is unauthorized
@@ -2290,6 +2310,8 @@ handle_ut(CliSock, ARG, UT = #urltype{type = dav}, N) ->
     SC=get(sc),
     Next =
         if
+            Req#http_request.method == 'OPTIONS' ->
+                options;
             Req#http_request.method == 'PUT' ->
                 fun(A) -> yaws_dav:put(SC, A) end;
             Req#http_request.method == 'DELETE' ->
@@ -2316,6 +2338,8 @@ handle_ut(CliSock, ARG, UT = #urltype{type = dav}, N) ->
     case Next of
         error ->
             handle_ut(CliSock, ARG, #urltype{type = error}, N);
+        options ->
+            deliver_options(CliSock, Req, []);
         {regular, Finfo} ->
             handle_ut(CliSock, ARG, UT#urltype{type = regular,
                                                finfo = Finfo}, N);
@@ -2527,6 +2551,9 @@ deliver_416(CliSock, _Req, Tot) ->
     deliver_accumulated(CliSock),
     done.
 
+deliver_431(CliSock, Req) ->
+    deliver_xxx(CliSock, Req, 431).
+
 deliver_501(CliSock, Req) ->
     deliver_xxx(CliSock, Req, 501). % Not implemented
 
@@ -2626,8 +2653,14 @@ deliver_dyn_part(CliSock,                       % essential params
     put(yaws_ut, UT),
     put(yaws_arg, Arg),
     put(client_data_pos, CliDataPos0),
-    Res = (catch YawsFun(Arg)),
-    case handle_out_reply(Res, LineNo, YawsFile, UT, Arg) of
+    OutReply = try
+                   Res = YawsFun(Arg),
+                   handle_out_reply(Res, LineNo, YawsFile, UT, Arg)
+               catch
+                   Class:Exc ->
+                       handle_out_reply({throw, Class, Exc}, LineNo, YawsFile, UT, Arg)
+               end,
+    case OutReply of
         {get_more, Cont, State} when element(1, Arg#arg.clidata) == partial  ->
             CliDataPos1 = get(client_data_pos),
             More = get_more_post_data(CliDataPos1, Arg),
@@ -2643,17 +2676,21 @@ deliver_dyn_part(CliSock,                       % essential params
         Arg2 = #arg{} ->
             DeliverCont(Arg2);
         {streamcontent, _, _} ->
-            Priv = deliver_accumulated(Arg, CliSock, decide, undefined, stream),
+            Priv = deliver_accumulated(Arg, CliSock, undefined, stream),
             stream_loop_send(Priv, CliSock, 30000);
         %% For other timeout values (other than 30 second)
         {streamcontent_with_timeout, _, _, TimeOut} ->
-            Priv = deliver_accumulated(Arg, CliSock, decide, undefined, stream),
+            Priv = deliver_accumulated(Arg, CliSock, undefined, stream),
             stream_loop_send(Priv, CliSock, TimeOut);
         {streamcontent_with_size, Sz, _, _} ->
-            Priv = deliver_accumulated(Arg, CliSock, decide, Sz, stream),
+            Priv = deliver_accumulated(Arg, CliSock, Sz, stream),
             stream_loop_send(Priv, CliSock, 30000);
         {streamcontent_from_pid, _, Pid} ->
-            Priv = deliver_accumulated(Arg, CliSock, no, undefined, stream),
+            case yaws:outh_get_content_encoding() of
+                decide -> yaws:outh_set_content_encoding(identity);
+                _      -> ok
+            end,
+            Priv = deliver_accumulated(Arg, CliSock, undefined, stream),
             wait_for_streamcontent_pid(Priv, CliSock, Pid);
         {websocket, CallbackMod, Opts} ->
             %% The handshake passes control over the socket to OwnerPid
@@ -2664,7 +2701,7 @@ deliver_dyn_part(CliSock,                       % essential params
     end.
 
 finish_up_dyn_file(Arg, CliSock) ->
-    deliver_accumulated(Arg, CliSock, decide, undefined, final),
+    deliver_accumulated(Arg, CliSock, undefined, final),
     done_or_continue().
 
 
@@ -2820,7 +2857,7 @@ make_final_chunk(Data) ->
 
 send_streamcontent_chunk(discard, _, _) ->
     discard;
-send_streamcontent_chunk(undeflated, CliSock, Data) ->
+send_streamcontent_chunk(undefined, CliSock, Data) ->
     case make_chunk(Data) of
         empty -> ok;
         {Size, Chunk} ->
@@ -2829,7 +2866,7 @@ send_streamcontent_chunk(undeflated, CliSock, Data) ->
             yaws:outh_inc_act_contlen(Size),
             yaws:gen_tcp_send(CliSock, Chunk)
     end,
-    undeflated;
+    undefined;
 send_streamcontent_chunk({Z, Priv}, CliSock, Data) ->
     ?Debug("send ~p bytes to ~p ~n",
            [binary_size(Data), CliSock]),
@@ -2845,8 +2882,8 @@ send_streamcontent_chunk({Z, Priv}, CliSock, Data) ->
 
 sync_streamcontent(discard, _CliSock) ->
     discard;
-sync_streamcontent(undeflated, _CliSock) ->
-    undeflated;
+sync_streamcontent(undefined, _CliSock) ->
+    undefined;
 sync_streamcontent({Z, Priv}, CliSock) ->
     ?Debug("syncing~n", []),
     {ok, P, D} = yaws_zlib:gzipDeflate(Z, Priv, <<>>, sync),
@@ -2861,7 +2898,7 @@ sync_streamcontent({Z, Priv}, CliSock) ->
 
 end_streaming(discard, _) ->
     done_or_continue();
-end_streaming(undeflated, CliSock) ->
+end_streaming(undefined, CliSock) ->
     ?Debug("end_streaming~n", []),
     {_, Chunk} = make_final_chunk(<<>>),
     yaws:gen_tcp_send(CliSock, Chunk),
@@ -3226,6 +3263,14 @@ handle_out_reply({'EXIT', Err}, LineNo, YawsFile, _UT, ARG) ->
            [YawsFile, LineNo, Err, ARG#arg.req, erlang:get_stacktrace()]),
     handle_crash(ARG, L);
 
+handle_out_reply({throw, Class, Exc}, LineNo, YawsFile, _UT, ARG) ->
+    L = ?F("~n~nERROR erlang code threw an uncaught exception:~n "
+           "File: ~s:~w~n"
+           "Class: ~p~nException: ~p~nReq: ~p~n"
+           "Stack: ~p~n",
+           [YawsFile, LineNo, Class, Exc, ARG#arg.req, erlang:get_stacktrace()]),
+    handle_crash(ARG, L);
+
 handle_out_reply({get_more, Cont, State}, _LineNo, _YawsFile, _UT, _ARG) ->
     {get_more, Cont, State};
 
@@ -3475,57 +3520,85 @@ handle_crash(ARG, L) ->
     end.
 
 %% Ret: true | false | {data, Data}
-decide_deflate(false, _, _, _, _) ->
+decide_deflate(false, _, _, _, _, _) ->
+    ?Debug("Compression not supported by the server~n", []),
     false;
-decide_deflate(_, _, _, no, _) ->
+decide_deflate(_, _, _, _, identity, _) ->
+    ?Debug("No compression: Encoding=identity~n", []),
     false;
-decide_deflate(true, _, _, deflate, stream) ->
-    true;
-decide_deflate(true, Arg, Data, decide, Mode) ->
-    case yaws:outh_get_content_encoding_header() of
-        undefined ->
-            ?Debug("No Content-Encoding defined~n",[]),
+decide_deflate(_, _, _, _, deflate, _) ->
+    ?Debug("Compression already handled: Encoding=deflate~n", []),
+    false;
+decide_deflate(true, SC, Arg, Data, decide, Mode) ->
+    Bin   = to_binary(Data),
+    DOpts = SC#sconf.deflate_options,
+    if
+        Mode == final andalso size(Bin) == 0 ->
+            ?Debug("No data to be compressed~n",[]),
+            false;
+
+        Mode == final andalso
+        DOpts#deflate.min_compress_size /= nolimit andalso
+        size(Bin) < DOpts#deflate.min_compress_size ->
+            ?Debug("Data too small to be compressed~n",[]),
+            false;
+
+        true ->
             Mime = yaws:outh_get_content_type(),
-            ?Debug("Mime-Type: ~p~n", [Mime]),
-            case compressible_mime_type(Mime) of
+            ?Debug("Check compression support: Mime-Type=~p~n", [Mime]),
+            case compressible_mime_type(Mime, DOpts) of
                 true ->
-                    case yaws:accepts_gzip(Arg#arg.headers, Mime) of
-                        true ->
-                            case Mode of
-                                final ->
-                                    {ok, DB} = yaws_zlib:gzip(to_binary(Data)),
-                                    {data, DB};
-                                stream ->
-                                    true
-                            end;
-                        false -> false
+                    case (Arg =:= undefined
+                          orelse
+                          yaws:accepts_gzip(Arg#arg.headers, Mime)) of
+                        true when Mode =:= final ->
+                            ?Debug("Compress data~n", []),
+                            yaws:outh_set_content_encoding(deflate),
+                            {ok, DB} = yaws_zlib:gzip(to_binary(Data), DOpts),
+                            {data, DB};
+                        true -> %% Mode == stream | {file,_,_}
+                            ?Debug("Compress streamed data~n", []),
+                            yaws:outh_set_content_encoding(deflate),
+                            true;
+                        false ->
+                            ?Debug("Compression not supported by the client~n",
+                                   []),
+                            yaws:outh_set_content_encoding(identity),
+                            false
                     end;
                 false ->
+                    ?Debug("~p is not compressible~n", [Mime]),
+                    yaws:outh_set_content_encoding(identity),
                     false
-            end;
-        _CE -> ?Debug("Content-Encoding: ~p~n",[_CE]),
-               false
+            end
     end.
 
 
-deliver_accumulated(Sock) ->
-    deliver_accumulated(undefined, Sock, no, undefined, final).
 
-%% Mode = final | stream
-%% Encoding = deflate    (gzip content)
-%%          | no         (keep as is)
-%%          | decide     (do as you like)
-%% ContentLength = Int | undefined
-%% Mode = final | stream
+deliver_accumulated(Sock) ->
+    case yaws:outh_get_content_encoding() of
+        decide -> yaws:outh_set_content_encoding(identity);
+        _      -> ok
+    end,
+    deliver_accumulated(undefined, Sock, undefined, final).
+
+%% Arg           = #arg{} | undefined
+%% ContentLength = Int    | undefined
+%% Mode          = final  | stream | {file, File, MTime}
 %%
 %% For Mode==final: (all content has been accumulated before calling
 %%                   deliver_accumulated)
-%%     Ret: can be ignored
+%%     Result: can be ignored
 %%
 %% For Mode==stream:
-%%     Ret: opaque value to be threaded through
-%%                   send_streamcontent_chunk / end_streaming
-deliver_accumulated(Arg, Sock, Encoding, ContentLength, Mode) ->
+%%     Result: opaque value to be threaded through
+%%             send_streamcontent_chunk / end_streaming
+%%
+%% For Mode=={file,File,MTime}:
+%%     Result: {gzfile, GzFile} is gzip_static option is enabled and if
+%%     GzFile exists. Else, same result than for Mode==stream
+
+deliver_accumulated(Arg, Sock, ContentLength, Mode) ->
     %% See if we must close the connection
     receive
         {_From, suspend} -> yaws:outh_set_connection(true)
@@ -3533,71 +3606,81 @@ deliver_accumulated(Arg, Sock, Encoding, ContentLength, Mode) ->
     end,
 
     Cont = case erase(acc_content) of
-               undefined ->
-                   [];
-               Cont2 ->
-                   Cont2
+               undefined -> [];
+               Cont2     -> Cont2
            end,
-    case Cont of
-        discard ->
-            yaws:outh_set_transfer_encoding_off(),
-            {StatusLine, Headers} = yaws:outh_serialize(),
-            ?Debug("discard accumulated~n", []),
-            All = [StatusLine, Headers, crnl()],
-            Ret = discard;
-        _ ->
-            SC = get(sc),
-            case decide_deflate(?sc_has_deflate(SC),
-                                Arg, Cont, Encoding, Mode) of
-                {data, Data} -> % implies Mode==final
-                    yaws:outh_set_content_encoding(deflate),
-                    Size = binary_size(Data),
-                    Ret = ok;
-                true -> % implies Mode==stream
-                    yaws:outh_set_content_encoding(deflate),
-                    Z = zlib:open(),
-                    {ok, Priv, Data} =
-                        yaws_zlib:gzipDeflate(Z, yaws_zlib:gzipInit(Z),
-                                              to_binary(Cont), none),
-                    Ret = {Z, Priv},
-                    Size = undefined;
-                false ->
-                    Ret = undeflated,
-                    Data = Cont,
-                    Size = case Mode of
-                               final ->
-                                   binary_size(Data);
-                               stream ->
-                                   ContentLength
-                           end
-            end,
-            case Size of
-                undefined ->
-                    yaws:outh_fix_doclose();
-                _ -> yaws:accumulate_header({content_length, Size})
-            end,
-            {StatusLine, Headers} = yaws:outh_serialize(),
-            case make_chunk(Data) of
-                empty ->
-                    Chunk = [];
-                {S, Chunk} ->
-                    case Mode of
-                        stream -> yaws:outh_inc_act_contlen(S);
-                        _ -> ok
-                    end
-            end,
-            All = [StatusLine, Headers, crnl(), Chunk]
-    end,
+    {Result, Data} = case Cont of
+                         discard ->
+                             yaws:outh_set_transfer_encoding_off(),
+                             {discard, []};
+                         _ ->
+                             deflate_accumulated(Arg, Cont, ContentLength, Mode)
+                     end,
+
+    {StatusLine, Headers} = yaws:outh_serialize(),
+    All = [StatusLine, Headers, crnl(), Data],
     yaws:gen_tcp_send(Sock, All),
     case yaws_trace:get_type(get(gc)) of
-        http ->
-            yaws_trace:write(from_server, [StatusLine, Headers]);
-        traffic ->
-            yaws_trace:write(from_server, All);
-        undefined ->
-            ok
+        http      -> yaws_trace:write(from_server, [StatusLine, Headers]);
+        traffic   -> yaws_trace:write(from_server, All);
+        undefined -> ok
     end,
-    Ret.
+    Result.
+
+deflate_accumulated(Arg, Content, ContentLength, Mode) ->
+    SC    = get(sc),
+    Enc   = yaws:outh_get_content_encoding(),
+    DOpts = SC#sconf.deflate_options,
+    {Result, Data, Size} =
+        case decide_deflate(?sc_has_deflate(SC), SC, Arg, Content, Enc, Mode) of
+            {data, Bin} ->
+                %% implies Mode==final
+                {undefined, Bin, binary_size(Bin)};
+
+            true when Mode == stream; DOpts#deflate.use_gzip_static == false ->
+                Z = zlib:open(),
+                {ok, Priv, Bin} =
+                    yaws_zlib:gzipDeflate(Z,yaws_zlib:gzipInit(Z,DOpts),
+                                          to_binary(Content),none),
+                {{Z, Priv}, Bin, undefined};
+            true ->
+                %% implies Mode=={file,_,_} and use_gzip_static==true
+                {file, File, MTime} = Mode,
+                GzFile = File++".gz",
+                case prim_file:read_file_info(GzFile) of
+                    {ok, FI} when FI#file_info.type == regular,
+                                  FI#file_info.mtime >= MTime ->
+                        {{gzfile, GzFile}, <<>>, FI#file_info.size};
+                    _ ->
+                        Z = zlib:open(),
+                        {ok, Priv, Bin} =
+                            yaws_zlib:gzipDeflate(Z,yaws_zlib:gzipInit(Z,DOpts),
+                                                  to_binary(Content),none),
+                        {{Z, Priv}, Bin, undefined}
+                end;
+
+            false when Mode == final ->
+                {undefined, Content, binary_size(Content)};
+            false ->
+                %% implies Mode=stream | {file,_,_}
+                {undefined, Content, ContentLength}
+        end,
+    case Size of
+        undefined -> yaws:outh_fix_doclose();
+        _         -> yaws:accumulate_header({content_length, Size})
+    end,
+    case Mode of
+        final ->
+            {Result, Data};
+        _ ->
+            case make_chunk(Data) of
+                empty ->
+                    {Result, []};
+                {S, Chunk} ->
+                    yaws:outh_inc_act_contlen(S),
+                    {Result, Chunk}
+            end
+    end.
 
 
 get_more_post_data(PPS, ARG) ->
@@ -3625,24 +3708,34 @@ get_more_post_data(PPS, ARG) ->
 
 ut_read(UT) ->
     ?Debug("ut_read() UT.fullpath = ~p~n", [UT#urltype.fullpath]),
-    case yaws:outh_get_content_encoding() of
-        identity ->
-            case UT#urltype.data of
-                undefined ->
-                    ?Debug("ut_read reading\n",[]),
-                    {ok, Bin} = file:read_file(UT#urltype.fullpath),
-                    ?Debug("ut_read read ~p\n",[size(Bin)]),
-                    Bin;
-                B when is_binary(B) ->
-                    B
-            end;
-        deflate ->
-            case UT#urltype.deflate of
-                B when is_binary(B) ->
-                    ?Debug("ut_read using deflated binary of size ~p~n",
-                           [size(B)]),
-                    B
-            end
+    CE = yaws:outh_get_content_encoding(),
+    if
+
+        (CE =:= identity) andalso is_binary(UT#urltype.data) ->
+            UT#urltype.data;
+        CE =:= identity ->
+            ?Debug("ut_read reading\n",[]),
+            {ok, Bin} = file:read_file(UT#urltype.fullpath),
+            ?Debug("ut_read read ~p\n",[size(Bin)]),
+            Bin;
+
+        (CE =:= decide) andalso is_binary(UT#urltype.deflate) ->
+            ?Debug("ut_read using deflated binary of size ~p~n",
+                   [size(UT#urltype.deflate)]),
+            yaws:outh_set_content_encoding(deflate),
+            UT#urltype.deflate;
+        CE =:= decide andalso is_binary(UT#urltype.data) ->
+            UT#urltype.data;
+        CE =:= decide ->
+            ?Debug("ut_read reading\n",[]),
+            {ok, Bin} = file:read_file(UT#urltype.fullpath),
+            ?Debug("ut_read read ~p\n",[size(Bin)]),
+            Bin;
+
+        CE =:= deflate ->
+            ?Debug("ut_read using deflated binary of size ~p~n",
+                   [size(UT#urltype.deflate)]),
+            UT#urltype.deflate
     end.
 
 
@@ -3734,38 +3827,45 @@ deliver_small_file(CliSock, _Req, UT, Range) ->
     done_or_continue().
 
 deliver_large_file(CliSock,  _Req, UT, Range) ->
-    Enc = case Range of
-              all ->
-                  case yaws:outh_get_content_encoding() of
-                      identity -> no;
-                      D -> D
-                  end;
-              _ -> no
-          end,
-    case deliver_accumulated(undefined, CliSock, Enc, undefined, stream) of
-        discard ->
-            ok;
-        Priv ->
-            send_file(CliSock, UT#urltype.fullpath, Range, Priv, Enc)
+    Sz = case Range of
+             all ->
+                 (UT#urltype.finfo)#file_info.size;
+             {fromto, From, To, _Tot} ->
+                 yaws:outh_set_content_encoding(identity),
+                 (To - From + 1)
+         end,
+    Mode = {file, UT#urltype.fullpath, mtime(UT#urltype.finfo)},
+    case deliver_accumulated(undefined, CliSock, Sz, Mode) of
+        discard -> ok;
+        Priv    -> send_file(CliSock, UT#urltype.fullpath, Range, Priv)
     end,
     done_or_continue().
 
 
-send_file(CliSock, Path, all, _Priv, no) when is_port(CliSock) ->
+send_file(CliSock, Path, all, undefined) when is_port(CliSock) ->
     ?Debug("send_file(~p,~p,no ...)~n", [CliSock, Path]),
-    yaws_sendfile:send(CliSock, Path),
-    {ok, Size} = yaws:filesize(Path),
+    {ok, Size} = yaws_sendfile:send(CliSock, Path),
     yaws_stats:sent(Size);
-send_file(CliSock, Path, all, Priv, _Enc) ->
+send_file(CliSock, Path, all, undefined) ->
+    ?Debug("send_file(~p,~p,no ...)~n", [CliSock, Path]),
+    {ok, Fd} = file:open(Path, [raw, binary, read]),
+    send_file(CliSock, Fd, undefined);
+send_file(CliSock, _, all, {gzfile, GzFile}) when is_port(CliSock) ->
+    ?Debug("send_file(~p,~p, ...)~n", [CliSock, GzFile]),
+    {ok, Size} = yaws_sendfile:send(CliSock, GzFile),
+    yaws_stats:sent(Size);
+send_file(CliSock, _, all, {gzfile, GzFile}) ->
+    ?Debug("send_file(~p,~p, ...)~n", [CliSock, GzFile]),
+    {ok, Fd} = file:open(GzFile, [raw, binary, read]),
+    send_file(CliSock, Fd, undefined);
+send_file(CliSock, Path, all, Priv) ->
     ?Debug("send_file(~p,~p, ...)~n", [CliSock, Path]),
     {ok, Fd} = file:open(Path, [raw, binary, read]),
     send_file(CliSock, Fd, Priv);
-send_file(CliSock, Path,  {fromto, From, To, _Tot}, undeflated, no)
-  when is_port(CliSock) ->
-    Size = To - From + 1,
-    yaws_sendfile:send(CliSock, Path, From, Size),
+send_file(CliSock, Path,  {fromto, From, To, _Tot}, _) when is_port(CliSock) ->
+    {ok, Size} = yaws_sendfile:send(CliSock, Path, From, (To-From+1)),
     yaws_stats:sent(Size);
-send_file(CliSock, Path,  {fromto, From, To, _Tot}, undeflated, _Enc) ->
+send_file(CliSock, Path,  {fromto, From, To, _Tot}, _) ->
     {ok, Fd} = file:open(Path, [raw, binary, read]),
     file:position(Fd, {bof, From}),
     send_file_range(CliSock, Fd, To - From + 1).
@@ -3788,11 +3888,11 @@ send_file_range(CliSock, Fd, Len) when Len > 0 ->
                               _ -> Len
                           end
                          ),
-    send_streamcontent_chunk(undeflated, CliSock, Bin),
+    send_streamcontent_chunk(undefined, CliSock, Bin),
     send_file_range(CliSock, Fd, Len - size(Bin));
 send_file_range(CliSock, Fd, 0) ->
     file:close(Fd),
-    end_streaming(undeflated, CliSock).
+    end_streaming(undefined, CliSock).
 
 crnl() ->
     "\r\n".
@@ -3859,7 +3959,7 @@ file_changed(UT1, UT2) ->
 
 
 cache_size(UT) when is_binary(UT#urltype.deflate),
-is_binary(UT#urltype.data) ->
+                    is_binary(UT#urltype.data) ->
     size(UT#urltype.deflate) + size(UT#urltype.data);
 cache_size(UT) when is_binary(UT#urltype.data) ->
     size(UT#urltype.data);
@@ -3884,15 +3984,15 @@ cache_file(SC, GC, Path, UT)
     ?Debug("FI=~s\n", [?format_record(FI, file_info)]),
     if
         N + 1 > GC#gconf.max_num_cached_files ->
-            error_logger:info_msg("Max NUM cached files reached for server "
-                                  "~p", [SC#sconf.servername]),
+            error_logger:info_msg("Max NUM cached files reached for server ~p",
+                                  [SC#sconf.servername]),
             cleanup_cache(E, num),
             cache_file(SC, GC, Path, UT);
         FI#file_info.size < GC#gconf.max_size_cached_file,
         FI#file_info.size < GC#gconf.max_num_cached_bytes,
         B + FI#file_info.size > GC#gconf.max_num_cached_bytes ->
-            error_logger:info_msg("Max size cached bytes reached for server "
-                                  "~p", [SC#sconf.servername]),
+            error_logger:info_msg("Max size cached bytes reached for server ~p",
+                                  [SC#sconf.servername]),
             cleanup_cache(E, size),
             cache_file(SC, GC, Path, UT);
         true ->
@@ -3904,31 +4004,34 @@ cache_file(SC, GC, Path, UT)
                     UT;
                 true ->
                     ?Debug("File fits\n",[]),
-                    {ok, Bin} = prim_file:read_file(
-                                  UT#urltype.fullpath),
+                    {ok, Bin} = prim_file:read_file(UT#urltype.fullpath),
+                    DOpts = SC#sconf.deflate_options,
                     Deflated =
-                        case ?sc_has_deflate(SC)
-                            and (UT#urltype.type==regular) of
+                        if
+                            size(Bin) == 0 ->
+                                undefined;
+                            DOpts#deflate.min_compress_size /= nolimit,
+                            size(Bin) < DOpts#deflate.min_compress_size ->
+                                undefined;
+                            UT#urltype.deflate /= dynamic ->
+                                undefined;
                             true ->
-                                {ok, DBL} = yaws_zlib:gzip(Bin),
+                                {ok, DBL} = yaws_zlib:gzip(Bin, DOpts),
                                 DB = list_to_binary(DBL),
                                 if
-                                    size(DB)*10<size(Bin)*9 ->
+                                    (10 * size(DB)) < (9 * size(Bin)) ->
                                         ?Debug("storing deflated version "
-                                               "of ~p~n",
-                                               [UT#urltype.fullpath]),
+                                               "of ~p~n",[UT#urltype.fullpath]),
                                         DB;
-                                    true -> undefined
-                                end;
-                            false -> undefined
+                                    true ->
+                                        undefined
+                                end
                         end,
-                    UT2 = UT#urltype{data = Bin,
-                                     deflate = Deflated},
+                    UT2 = UT#urltype{data = Bin, deflate = Deflated},
                     ets:insert(E, {{url, Path}, now_secs(), UT2}),
                     ets:insert(E, {{urlc, Path}, 1}),
                     ets:update_counter(E, num_files, 1),
-                    ets:update_counter(E, num_bytes,
-                                       cache_size(UT2)),
+                    ets:update_counter(E, num_bytes, cache_size(UT2)),
                     UT2
             end
     end;
@@ -3969,7 +4072,7 @@ do_url_type(SC, GetPath, ArgDocroot, VirtualDir) ->
     case GetPath of
         _ when ?sc_has_dav(SC) ->
             {Comps, RevFile} = comp_split(GetPath),
-            {_Type, _, Mime} = suffix_type(RevFile),
+            {_Type, Mime} = suffix_type(SC, RevFile),
 
             FullPath = construct_fullpath(ArgDocroot, GetPath, VirtualDir),
 
@@ -4018,7 +4121,7 @@ do_url_type(SC, GetPath, ArgDocroot, VirtualDir) ->
                             #urltype{type=Type,
                                      finfo=FI,
                                      deflate=deflate_q(?sc_has_deflate(SC),
-                                                       Type, Mime),
+                                                       SC, Type, Mime),
                                      dir = conc_path(Comps),
                                      path = GetPath,
                                      getpath = GetPath,
@@ -4272,6 +4375,8 @@ split_at_segment(Seg,[H|Tail],Acc) ->
 %%
 %%i.e this is an inner function, so no sanity checks here.
 %%
+construct_fullpath(undefined,_,_) ->
+    undefined;
 construct_fullpath(DocRoot,GetPath,VirtualDir) ->
     case VirtualDir of
         [] ->
@@ -4287,52 +4392,47 @@ construct_fullpath(DocRoot,GetPath,VirtualDir) ->
 %%preconditions:
 %% - see 'construct_fullpath'
 %%
-try_index_file(DR, GetPath, VirtualDir) ->
-    FullPath = construct_fullpath(DR, GetPath, VirtualDir),
-
-    case prim_file:read_file_info([FullPath, "index.yaws"]) of
+try_index_file(_FullPath, _GetPath, []) ->
+    noindex;
+try_index_file(FullPath, GetPath, [[$/|_]=Idx|Rest]) ->
+    case (GetPath =:= Idx orelse GetPath =:= Idx++"/") of
+        true  -> try_index_file(FullPath, GetPath, Rest);
+        false -> {redir, Idx}
+    end;
+try_index_file(FullPath, GetPath, [Idx|Rest]) ->
+    case prim_file:read_file_info([FullPath, Idx]) of
         {ok, FI} when FI#file_info.type == regular ->
-            do_url_type(get(sc), GetPath ++ "index.yaws", DR, VirtualDir);
+            {index, Idx};
         _ ->
-            case prim_file:read_file_info([FullPath, "index.html"]) of
-                {ok, FI} when FI#file_info.type == regular ->
-                    do_url_type(get(sc), GetPath ++ "index.html", DR,
-                                VirtualDir);
-                _ ->
-                    case prim_file:read_file_info([FullPath, "index.php"]) of
-                        {ok, FI} when FI#file_info.type == regular ->
-                            do_url_type(get(sc), GetPath ++ "index.php", DR,
-                                        VirtualDir);
-                        _ ->
-                            noindex
-                    end
-            end
+            try_index_file(FullPath, GetPath, Rest)
     end.
 
 
 maybe_return_dir(DR, GetPath,VirtualDir) ->
-    case try_index_file(DR, GetPath,VirtualDir) of
+    SC = get(sc),
+    FullPath = construct_fullpath(DR, GetPath, VirtualDir),
+    case try_index_file(FullPath, GetPath, SC#sconf.index_files) of
+        {index, Idx} ->
+            do_url_type(SC, GetPath ++ Idx, DR, VirtualDir);
+        {redir, NewPath} ->
+            #urltype{type=redir, path=NewPath};
         noindex ->
-            FullPath = construct_fullpath(DR, GetPath, VirtualDir),
-
             case file:list_dir(FullPath) of
                 {ok, List} ->
-                    #urltype{type = directory,
+                    #urltype{type     = directory,
                              fullpath = FullPath,
-                             dir = GetPath,
-                             data = List -- [".yaws_auth"]};
+                             dir      = GetPath,
+                             data     = List -- [".yaws_auth"]};
                 _Err ->
                     #urltype{type=error}
-            end;
-        UT ->
-            UT
+            end
     end.
 
 
 
 maybe_return_path_info(SC, Comps, RevFile, DR, VirtualDir) ->
 
-    case path_info_split(Comps, {DR, VirtualDir}) of
+    case path_info_split(SC, Comps, {DR, VirtualDir}) of
         {not_a_script, error} ->
             %%can we use urltype.data to return more info?
             %% - logging?
@@ -4362,7 +4462,7 @@ maybe_return_path_info(SC, Comps, RevFile, DR, VirtualDir) ->
             #urltype{type = Type2,
                      finfo=FI,
                      deflate=deflate_q(?sc_has_deflate(SC),
-                                       Type, Mime),
+                                       SC, Type, Mime),
                      dir =  conc_path(HeadComps),
                      path = conc_path(HeadComps ++ [File]),
                      fullpath = FullPath,
@@ -4392,21 +4492,21 @@ maybe_return_path_info(SC, Comps, RevFile, DR, VirtualDir) ->
 %% point', otherwise the Docroot that has been determined based on the full
 %%  request path becomes invalid!
 %%
-path_info_split(Comps,DR_Vdir) ->
-    path_info_split(lists:reverse(Comps), DR_Vdir, []).
+path_info_split(SC, Comps,DR_Vdir) ->
+    path_info_split(SC, lists:reverse(Comps), DR_Vdir, []).
 
-path_info_split([H|T], {DR, VirtualDir}, AccPathInfo) ->
+path_info_split(SC, [H|T], {DR, VirtualDir}, AccPathInfo) ->
     [$/|RevPath] = lists:reverse(H),
     case suffix_from_rev(RevPath) of
         [] ->   % shortcut clause, not necessary
-            path_info_split(T, {DR, VirtualDir}, [H|AccPathInfo]);
+            path_info_split(SC, T, {DR, VirtualDir}, [H|AccPathInfo]);
         Suff ->
-            {Type, Mime} = mime_types:t(Suff),
+            {Type, Mime} = mime_types:t(SC, Suff),
             case Type of
                 regular ->
                     %%Don't hit the filesystem to test components that
                     %%'mime_types' indicates can't possibly be scripts
-                    path_info_split(T, {DR, VirtualDir}, [H|AccPathInfo]);
+                    path_info_split(SC, T, {DR, VirtualDir}, [H|AccPathInfo]);
                 X ->
 
                     %%We may still be in the 'PATH_INFO' section
@@ -4427,11 +4527,11 @@ path_info_split([H|T], {DR, VirtualDir}, AccPathInfo) ->
                             {not_a_script, error};
                         _Err ->
                             %%just looked like a script - keep going.
-                            path_info_split(T, {DR, VirtualDir}, [H|AccPathInfo])
+                            path_info_split(SC, T, {DR, VirtualDir}, [H|AccPathInfo])
                     end
             end
     end;
-path_info_split([], _DR_Vdir, _Acc) ->
+path_info_split(_SC, [], _DR_Vdir, _Acc) ->
     {not_a_script, error}.
 
 
@@ -4541,53 +4641,44 @@ parse_user_path(DR, [H|T], User) ->
     parse_user_path(DR, T, [H|User]).
 
 
-deflate_q(true, regular, Mime) ->
-    case compressible_mime_type(Mime) of
+deflate_q(true, SC, regular, Mime) ->
+    case compressible_mime_type(Mime, SC#sconf.deflate_options) of
         true -> dynamic;
         false -> undefined
     end;
-deflate_q(_, _, _) ->
+deflate_q(_, _, _, _) ->
     undefined.
 
 
 suffix_type(SC, L) ->
-    R=suffix_type(L),
-    case R of
+    case mime_types:revt(SC, yaws:upto_char($., L)) of
         {regular, _Ext, Mime} ->
             {regular, Mime};
         {X, _Ext, Mime} ->
             case member(X, SC#sconf.allowed_scripts) of
-                true -> {X, Mime};
-                false -> {regular, "text/plain"}
+                true  -> {X, Mime};
+                false -> {regular, mime_types:default_type(SC)}
             end
     end.
 
-suffix_type(L) ->
-    L2 = yaws:upto_char($., L),
-    mime_types:revt(L2).
 
+compressible_mime_type(Mime, #deflate{mime_types=MimeTypes}) ->
+    case yaws:split_sep(Mime, $/) of
+        [Type, SubType] -> compressible_mime_type(Type, SubType, MimeTypes);
+        _               -> false
+    end.
 
+compressible_mime_type(_, _, all) ->
+    true;
+compressible_mime_type(_, _, []) ->
+    false;
+compressible_mime_type(Type, _, [{Type, all}|_]) ->
+    true;
+compressible_mime_type(Type, SubType, [{Type, SubType}|_]) ->
+    true;
+compressible_mime_type(Type, SubType, [_|Rest]) ->
+    compressible_mime_type(Type, SubType, Rest).
 
-%% Some silly heuristics.
-
-compressible_mime_type("text/"++_) ->
-    true;
-compressible_mime_type("application/rtf") ->
-    true;
-compressible_mime_type("application/msword") ->
-    true;
-compressible_mime_type("application/postscript") ->
-    true;
-compressible_mime_type("application/pdf") ->
-    true;
-compressible_mime_type("application/x-dvi") ->
-    true;
-compressible_mime_type("application/javascript") ->
-    true;
-compressible_mime_type("application/x-javascript") ->
-    true;
-compressible_mime_type(_) ->
-    false.
 
 
 flush(Sock, Sz, TransferEncoding) ->
@@ -4789,10 +4880,10 @@ close_accepted_if_max(GS,{ok, Socket}) ->
 	    ok;
         true ->
             S=case peername(Socket, GS#gs.ssl) of
-                  {ok, {IP, Port}} ->
-                      io_lib:format("~s:~w", [inet_parse:ntoa(IP), Port]);
-                  _ ->
-                      "unknown"
+                  {unknown, unknown} ->
+                      "unknown";
+                  {IP, Port} ->
+                      io_lib:format("~s:~w", [inet_parse:ntoa(IP), Port])
               end,
             error_logger:format(
               "Max connections reached - closing conn to ~s~n",[S]),

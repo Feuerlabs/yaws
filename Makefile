@@ -28,13 +28,13 @@ install:	all
 		then ( cd $$d && $(MAKE) $@ ) || exit 1 ; \
 	    fi ; \
 	done
-	$(INSTALL) -d $(DESTDIR)$(PREFIX)/lib/pkgconfig
-	$(INSTALL) -m 644 $(PKGCONFIG_FILES) $(DESTDIR)$(PREFIX)/lib/pkgconfig
+	$(INSTALL) -d $(DESTDIR)$(LIBDIR)/pkgconfig
+	$(INSTALL) -m 644 $(PKGCONFIG_FILES) $(DESTDIR)$(LIBDIR)/pkgconfig
 	@echo "-------------------------------"
 	@echo
 	@echo "** etc files went into        ${ETCDIR}"
 	@echo "** executables went into      ${prefix}/bin"
-	@echo "** library files went into    ${prefix}/lib/yaws"
+	@echo "** library files went into    ${LIBDIR}/yaws"
 	@echo "** var files went into        ${VARDIR}"
 	@echo "** default docroot went into  ${VARDIR}/yaws/www"
 	@echo
@@ -79,7 +79,7 @@ touch:
 	find . -name '*.erl' -print | xargs touch -m
 
 yaws.plt:
-	dialyzer --build_plt -r . --output_plt yaws.plt \
+	dialyzer --build_plt -r ebin src --output_plt yaws.plt \
 	   -r $(ERLDIR)/lib/sasl-$(SASL_VSN) \
 	   -r $(ERLDIR)/lib/kernel-$(KERNEL_VSN) \
 	   -r $(ERLDIR)/lib/stdlib-$(STDLIB_VSN) \
@@ -89,8 +89,9 @@ yaws.plt:
 #   	   -r $(ERLDIR)/lib/ssl-$(SSL_VSN)
 
 dialyzer:	yaws.plt
-	dialyzer --plt yaws.plt -r .
+	-dialyzer -q --plt yaws.plt -r ebin src > dialyzer_warnings
+	diff -U0 known_dialyzer_warnings dialyzer_warnings
 
 .PHONY: test
-test:
+test: all
 	cd test && $(MAKE) all setup test

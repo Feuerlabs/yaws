@@ -8,6 +8,7 @@
 -module(yaws_log).
 -author('klacke@hyber.org').
 -include_lib("kernel/include/file.hrl").
+-include_lib("kernel/include/inet.hrl").
 
 
 -behaviour(gen_server).
@@ -44,12 +45,12 @@
 -define(WRAP_LOG_SIZE, 1000000).
 
 
--record(state, {
-          running,
-          dir,
-          now,
-          log_wrap_size = ?WRAP_LOG_SIZE,
-          copy_errlog}).
+-record(state, {running,
+                dir,
+                now,
+                log_wrap_size = ?WRAP_LOG_SIZE,
+                copy_errlog,
+                resolve_hostnames = false}).
 
 
 %%%----------------------------------------------------------------------
@@ -177,7 +178,8 @@ handle_call({setup, GC, Sconfs}, _From, State)
                      dir  = Dir,
                      now = fmtnow(),
                      log_wrap_size = GC#gconf.log_wrap_size,
-                     copy_errlog = Copy},
+                     copy_errlog = Copy,
+                     resolve_hostnames = ?gc_log_has_resolve_hostname(GC)},
 
     yaws:ticker(3000, secs3),
 
@@ -226,8 +228,17 @@ handle_call({setup, GC, Sconfs}, _From, State)
     S2 = State#state{running = true,
                      dir  = Dir,
                      now = fmtnow(),
-                     copy_errlog = Copy},
+                     log_wrap_size = GC#gconf.log_wrap_size,
+                     copy_errlog = Copy,
+                     resolve_hostnames = ?gc_log_has_resolve_hostname(GC)},
 
+    if
+        not is_integer(State#state.log_wrap_size),
+        is_integer(GC#gconf.log_wrap_size) ->
+            yaws:ticker(10 * 60 * 1000, minute10);
+       true ->
+            ok
+    end,
     {reply, ok, S2};
 
 
@@ -293,7 +304,7 @@ handle_cast({_ServerName, access, Fd, {Ip, Req, InH, OutH, _}}, State) ->
                       {0,9} -> "HTTP/0.9"
                   end,
 
-            Path      = safe_decode_path(Req#http_request.path),
+            Path      = yaws_server:safe_decode_path(Req#http_request.path),
             Meth      = yaws:to_list(Req#http_request.method),
             Referer   = optional_header(InH#headers.referer),
             UserAgent = optional_header(InH#headers.user_agent),
@@ -302,10 +313,10 @@ handle_cast({_ServerName, access, Fd, {Ip, Req, InH, OutH, _}}, State) ->
                             _              -> "-"
                         end,
 
-            Msg = fmt_access_log(State#state.now, Ip, User,
+            Msg = fmt_access_log(State#state.now, fmt_ip(Ip, State), User,
                                  [Meth, $\s, Path, $\s, Ver],
                                  Status,  Len, Referer, UserAgent),
-            file:write(Fd, Msg),
+            file:write(Fd, safe_log_data(Msg)),
             {noreply, State};
         false ->
             {noreply, State}
@@ -314,19 +325,16 @@ handle_cast({_ServerName, access, Fd, {Ip, Req, InH, OutH, _}}, State) ->
 handle_cast({ServerName, auth, Fd, {Ip, Path, Item}}, State) ->
     case State#state.running of
         true ->
-            IpStr = case catch inet_parse:ntoa(Ip) of
-                        {'EXIT', _} -> "unknownip";
-                        Val -> Val
-                    end,
-            Msg = [IpStr, " ", State#state.now, " ", ServerName, " " ,
-                   "\"", Path,"\"",
+            Host = fmt_ip(Ip, State),
+            Msg  = [Host, " ", State#state.now, " ", ServerName, " " ,
+                    "\"", Path,"\"",
                    case Item of
                        {ok, User}       -> [" OK user=", User];
                        403              -> [" 403"];
                        {401, Realm}     -> [" 401 realm=", Realm];
                        {401, User, PWD} -> [" 401 user=", User, " badpwd=", PWD]
                    end, "\n"],
-            file:write(Fd, Msg),
+            file:write(Fd, safe_log_data(Msg)),
             {noreply, State};
         false ->
             {noreply,State}
@@ -400,23 +408,14 @@ code_change(_OldVsn, Data, _Extra) ->
 %%%----------------------------------------------------------------------
 %%% Internal functions
 %%%----------------------------------------------------------------------
-safe_decode_path({abs_path, Path}) ->
-    case catch yaws_api:url_decode(Path) of
-        {'EXIT', _} -> "/undecodable_path";
-        Val         -> Val
-    end;
-safe_decode_path(_) ->
-    "/undecodable_path".
-
-
 optional_header(Item) ->
     case Item of
         undefined -> "-";
         Item -> Item
     end.
 
-fmt_access_log(Time, Ip, User, Req, Status,  Length, Referrer, UserAgent) ->
-    [fmt_ip(Ip), " - ", User, [$\s], Time, [$\s, $"], no_ctl(Req), [$",$\s],
+fmt_access_log(Time, Host, User, Req, Status,  Length, Referrer, UserAgent) ->
+    [Host, " - ", User, [$\s], Time, [$\s, $\"], no_ctl(Req), [$\",$\s],
      Status, [$\s], Length, [$\s,$"], Referrer, [$",$\s,$"], UserAgent,
      [$",$\n]].
 
@@ -432,11 +431,29 @@ no_ctl([]) ->
     [].
 
 
-fmt_ip(IP) when is_tuple(IP) ->
-    inet_parse:ntoa(IP);
-fmt_ip(undefined) ->
+fmt_ip(IP, State) when is_tuple(IP) ->
+    case State#state.resolve_hostnames of
+        true ->
+            case catch inet:gethostbyaddr(IP) of
+                {ok, HE} ->
+                    HE#hostent.h_name;
+                _ ->
+                    case catch inet_parse:ntoa(IP) of
+                        {'EXIT', _} -> "unknownip";
+                        Addr        -> Addr
+                    end
+            end;
+        false ->
+            case catch inet_parse:ntoa(IP) of
+                {'EXIT', _} -> "unknownip";
+                Addr        -> Addr
+            end
+    end;
+fmt_ip(unknown, _) ->
+    "unknownip";
+fmt_ip(undefined, _) ->
     "0.0.0.0";
-fmt_ip(HostName) ->
+fmt_ip(HostName, _) ->
     HostName.
 
 
@@ -471,6 +488,9 @@ left_fill(N, Width, _Fill) when length(N) >= Width ->
     N;
 left_fill(N, Width, Fill) ->
     left_fill([Fill|N], Width, Fill).
+
+safe_log_data(Elements) ->
+    [ yaws:to_string(E) || E <- Elements ].
 
 
 

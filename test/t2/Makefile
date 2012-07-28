@@ -1,11 +1,11 @@
 include ../support/include.mk
 
-.PHONY: all test debug clean
+.PHONY: all test conf debug clean
 
 #
 all:	conf setup app_test.beam streamtest.beam jsontest.beam posttest.beam \
 		reentranttest.beam phptest.beam rewritetest.beam shapertest.beam \
-		flushtest.beam
+		flushtest.beam throwtest.beam
 	@echo "all ok"
 
 
@@ -15,7 +15,7 @@ all:	conf setup app_test.beam streamtest.beam jsontest.beam posttest.beam \
 
 ULIMIT = 768
 
-test:	conf start
+test:	all start
 	dd if=/dev/zero of=../../www/1000.txt bs=1024 count=1000 >/dev/null 2>&1
 	dd if=/dev/zero of=../../www/2000.txt bs=1024 count=2000 >/dev/null 2>&1
 	dd if=/dev/zero of=../../www/3000.txt bs=1024 count=3000 >/dev/null 2>&1
