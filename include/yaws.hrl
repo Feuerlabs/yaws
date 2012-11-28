@@ -170,8 +170,6 @@
         SC#sconf{flags = yaws:flag(SC#sconf.flags, ?SC_ADD_PORT, Bool)}).
 -define(sc_set_statistics(SC, Bool),
         SC#sconf{flags = yaws:flag(SC#sconf.flags, ?SC_STATISTICS, Bool)}).
--define(sc_set_ssl(SC, Bool),
-        SC#sconf{flags = yaws:flag(SC#sconf.flags, ?SC_SSL, Bool)}).
 -define(sc_set_tilde_expand(SC, Bool),
         SC#sconf{flags = yaws:flag(SC#sconf.flags, ?SC_TILDE_EXPAND, Bool)}).
 -define(sc_set_dir_listings(SC, Bool),
@@ -242,7 +240,8 @@
           php_handler = {cgi, "/usr/bin/php-cgi"},
           shaper,
           deflate_options,
-          mime_types_info               % if undefined, global config is used
+          mime_types_info,              % if undefined, global config is used
+          dispatch_mod                  % custom dispatch module
          }).
 
 

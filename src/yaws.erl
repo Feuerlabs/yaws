@@ -30,8 +30,9 @@
 -export([first/2, elog/2, filesize/1, upto/2, to_string/1, to_list/1,
          integer_to_hex/1, hex_to_integer/1, string_to_hex/1, hex_to_string/1,
          is_modified_p/2, flag/3, dohup/1, is_ssl/1, address/0, is_space/1,
-         setopts/3, eat_crnl/2, get_chunk_num/2, get_chunk/4, list_to_uue/1,
-         uue_to_list/1, printversion/0, strip_spaces/1, strip_spaces/2,
+         setopts/3, eat_crnl/2, get_chunk_num/2, get_chunk_header/2,
+         get_chunk/4, get_chunk_trailer/2, list_to_uue/1, uue_to_list/1,
+         printversion/0, strip_spaces/1, strip_spaces/2,
          month/1, mk2/1, home/0, arg_rewrite/1, to_lowerchar/1, to_lower/1,
          funreverse/2, is_prefix/2, split_sep/2, join_sep/2, accepts_gzip/2,
          upto_char/2, deepmap/2, ticker/2, ticker/3,
@@ -97,6 +98,11 @@
          tmpdir/0, tmpdir/1, mktemp/1, split_at/2,
          id_dir/1, ctl_file/1]).
 
+-export([parse_ipmask/1, match_ipmask/2]).
+
+%% Internal
+-export([local_time_as_gmt_string/1, universal_time_as_string/1,
+         stringdate_to_datetime/1]).
 
 start() ->
     application:start(yaws, permanent).
@@ -283,7 +289,9 @@ setup_sconf(SL, SC) ->
            deflate_options       = lkup(deflate_options, SL,
                                         SC#sconf.deflate_options),
            mime_types_info       = lkup(mime_types_info, SL,
-                                        SC#sconf.mime_types_info)
+                                        SC#sconf.mime_types_info),
+           dispatch_mod          = lkup(dispatchmod, SL,
+                                        SC#sconf.dispatch_mod)
           }.
 
 expand_auth(SL) ->
@@ -418,7 +426,7 @@ upto(I,  [H|T]) -> [H|upto(I-1, T)].
 
 
 to_string(X) when is_float(X)   -> io_lib:format("~.2.0f",[X]);
-to_string(X) when is_integer(X) -> integer_to_list(X);
+to_string(X) when is_integer(X) -> erlang:integer_to_list(X);
 to_string(X) when is_atom(X)    -> atom_to_list(X);
 to_string(X)                    -> lists:concat([X]).
 
@@ -478,11 +486,11 @@ local_time_as_gmt_string(LocalTime) ->
 
 time_to_string({{Year, Month, Day}, {Hour, Min, Sec}}, Zone) ->
     [day(Year, Month, Day), ", ",
-     mk2(Day), " ", month(Month), " ", integer_to_list(Year), " ",
+     mk2(Day), " ", month(Month), " ", erlang:integer_to_list(Year), " ",
      mk2(Hour), ":", mk2(Min), ":", mk2(Sec), " ", Zone].
 
-mk2(I) when I < 10 -> [$0 | integer_to_list(I)];
-mk2(I)             -> integer_to_list(I).
+mk2(I) when I < 10 -> [$0 | erlang:integer_to_list(I)];
+mk2(I)             -> erlang:integer_to_list(I).
 
 day(Year, Month, Day) ->
     int_to_wd(calendar:day_of_the_week(Year, Month, Day)).
@@ -528,18 +536,18 @@ stringdate_to_datetime([_D1, _D2, _D3, $\,, $ |Tail]) ->
     stringdate_to_datetime1(Tail).
 
 stringdate_to_datetime1([A, B, $\s |T]) ->
-    stringdate_to_datetime2(T, list_to_integer([A,B]));
+    stringdate_to_datetime2(T, erlang:list_to_integer([A,B]));
 stringdate_to_datetime1([A, $\s |T]) ->
-    stringdate_to_datetime2(T, list_to_integer([A])).
+    stringdate_to_datetime2(T, erlang:list_to_integer([A])).
 
 stringdate_to_datetime2([M1, M2, M3, $\s , Y1, Y2, Y3, Y4, $\s,
                          H1, H2, $:, Min1, Min2,$:,
                          S1, S2,$\s ,$G, $M, $T|_], Day) ->
-    {{list_to_integer([Y1,Y2,Y3,Y4]),
+    {{erlang:list_to_integer([Y1,Y2,Y3,Y4]),
       month_str_to_int([M1, M2, M3]), Day},
-     {list_to_integer([H1, H2]),
-      list_to_integer([Min1, Min2]),
-      list_to_integer([S1, S2])}}.
+     {erlang:list_to_integer([H1, H2]),
+      erlang:list_to_integer([Min1, Min2]),
+      erlang:list_to_integer([S1, S2])}}.
 
 
 %% used by If-Modified-Since header code
@@ -1161,8 +1169,11 @@ make_allow_header(Options) ->
         [] ->
             HasDav = ?sc_has_dav(get(sc)),
             ["Allow: GET, POST, OPTIONS, HEAD",
-             if HasDav == true -> ", PUT, DELETE, PROPFIND, MKCOL, MOVE, COPY";
-                true           -> ""
+             case HasDav of
+                 true ->
+                     ", PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, COPY";
+                 false ->
+                     ""
              end, "\r\n"];
         _ ->
             ["Allow: ",
@@ -1178,7 +1189,7 @@ make_server_header() ->
                     undefined -> (get(gc))#gconf.yaws;
                     S         -> S
                 end,
-    ["Server: ", Signature, "\r\n" | if HasDav == true -> ["DAV: 1\r\n"];
+    ["Server: ", Signature, "\r\n" | if HasDav == true -> ["DAV: 1, 2, 3\r\n"];
                                         true           -> []
                                      end].
 
@@ -1252,7 +1263,7 @@ make_cache_control_header(MimeType, FI) ->
 
 
 make_cache_control_header(TTL) ->
-    ["Cache-Control: ", "max-age=", integer_to_list(TTL), "\r\n"].
+    ["Cache-Control: ", "max-age=", erlang:integer_to_list(TTL), "\r\n"].
 
 
 make_location_header(Where) ->
@@ -1290,14 +1301,14 @@ make_content_range_header(all) ->
     undefined;
 make_content_range_header({fromto, From, To, Tot}) ->
     ["Content-Range: bytes ",
-     integer_to_list(From), $-, integer_to_list(To),
-     $/, integer_to_list(Tot), $\r, $\n].
+     erlang:integer_to_list(From), $-, erlang:integer_to_list(To),
+     $/, erlang:integer_to_list(Tot), $\r, $\n].
 
 make_content_length_header(Size) when is_integer(Size) ->
-    ["Content-Length: ", integer_to_list(Size), "\r\n"];
+    ["Content-Length: ", erlang:integer_to_list(Size), "\r\n"];
 make_content_length_header(FI) when is_record(FI, file_info) ->
     Size = FI#file_info.size,
-    ["Content-Length: ", integer_to_list(Size), "\r\n"];
+    ["Content-Length: ", erlang:integer_to_list(Size), "\r\n"];
 make_content_length_header(_) ->
     undefined.
 
@@ -1382,7 +1393,7 @@ outh_serialize() ->
                undefined -> 200;
                Int       -> Int
            end,
-    StatusLine = ["HTTP/1.1 ", integer_to_list(Code), " ",
+    StatusLine = ["HTTP/1.1 ", erlang:integer_to_list(Code), " ",
                   yaws_api:code_to_phrase(Code), "\r\n"],
     GC=get(gc),
     if ?gc_has_debug(GC) -> yaws_debug:check_headers(H);
@@ -1523,7 +1534,7 @@ accumulate_header({"Content-Length", Len}) ->
         I when is_integer(I) ->
             accumulate_header({content_length, I});
         L when is_list(L) ->
-            accumulate_header({content_length, list_to_integer(L)})
+            accumulate_header({content_length, erlang:list_to_integer(L)})
     end;
 
 accumulate_header({transfer_encoding, What}) ->
@@ -1630,7 +1641,8 @@ user_to_home(User) ->
 
 uid_to_name(Uid) ->
     load_setuid_drv(),
-    P = open_port({spawn, "setuid_drv " ++ [$n|integer_to_list(Uid)]}, []),
+    P = open_port({spawn, "setuid_drv " ++
+                       [$n|erlang:integer_to_list(Uid)]}, []),
     receive
         {P, {data, "ok " ++ Name}} ->
             Name
@@ -2070,9 +2082,9 @@ redirect_port(SC) ->
         {"https", _, 443}    -> "";
         {"http", _, 80}      -> "";
         {_, undefined, 80}   -> "";
-        {_, undefined, Port} -> [$:|integer_to_list(Port)];
+        {_, undefined, Port} -> [$:|erlang:integer_to_list(Port)];
         {_, _SSL, 443}       -> "";
-        {_, _SSL, Port}      -> [$:|integer_to_list(Port)]
+        {_, _SSL, Port}      -> [$:|erlang:integer_to_list(Port)]
     end.
 
 redirect_scheme_port(SC) ->
@@ -2121,8 +2133,9 @@ mktemp(Template, Ret) ->
 
 mktemp(Dir, Template, Ret, I, Max, Suffix) when I < Max ->
     {X,Y,Z}  = now(),
-    PostFix = integer_to_list(X) ++ "-" ++ integer_to_list(Y) ++ "-" ++
-        integer_to_list(Z),
+    PostFix = erlang:integer_to_list(X) ++ "-" ++
+        erlang:integer_to_list(Y) ++ "-" ++
+        erlang:integer_to_list(Z),
     F = filename:join(Dir, Template ++ [$_ | PostFix] ++ Suffix),
     filelib:ensure_dir(F),
     case file:open(F, [read, raw]) of
@@ -2174,25 +2187,26 @@ eat_crnl(Fd,SSL) ->
     case do_recv(Fd,0, SSL) of
         {ok, <<13,10>>} -> ok;
         {ok, [13,10]}   -> ok;
-        Err             -> {error, Err}
+        _               -> exit(normal)
     end.
 
-get_chunk_num(Fd,SSL) ->
+
+get_chunk_num(Fd, SSL) ->
+    {N, _} = get_chunk_header(Fd, SSL),
+    N.
+
+get_chunk_header(Fd, SSL) ->
     case do_recv(Fd, 0, SSL) of
-        {ok, Line} ->
+        {ok, Data} ->
+            Line = if is_binary(Data) -> binary_to_list(Data);
+                      true            -> Data
+                   end,
             ?Debug("Get chunk num from line ~p~n",[Line]),
-            erlang:list_to_integer(nonl(Line),16);
+            {N, Exts} = split_at(Line, $;),
+            {erlang:list_to_integer(strip_spaces(N),16), strip_spaces(Exts)};
         {error, _Rsn} ->
             exit(normal)
     end.
-
-nonl(B) when is_binary(B) -> nonl(binary_to_list(B));
-nonl([10|T])              -> nonl(T);
-nonl([13|T])              -> nonl(T);
-nonl([32|T])              -> nonl(T);
-nonl([H|T])               -> [H|nonl(T)];
-nonl([])                  -> [].
-
 
 
 get_chunk(_Fd, N, N, _) ->
@@ -2206,6 +2220,14 @@ get_chunk(Fd, N, Asz,SSL) ->
             exit(normal)
     end.
 
+get_chunk_trailer(Fd, SSL) ->
+    Hdrs = #headers{},
+    case http_collect_headers(Fd, undefined, Hdrs, SSL, 0) of
+        {error,_} -> exit(normal);
+        Hdrs      -> <<>>;
+        NewHdrs   -> {<<>>, NewHdrs}
+    end.
+
 %% split inputstring at first occurrence of Char
 split_at(String, Char) ->
     split_at(String, Char, []).
@@ -2215,3 +2237,136 @@ split_at([H|T], Char, Ack) ->
     split_at(T, Char, [H|Ack]);
 split_at([], _Char, Ack) ->
     {lists:reverse(Ack), []}.
+
+
+%% Parse an Ip address or an Ip address range
+%% Return Ip || {IpMin, IpMax} where:
+%%     Ip, IpMin, IpMax ::= ip_address()
+parse_ipmask(Str) when is_list(Str) ->
+    case string:tokens(Str, [$/]) of
+        [IpStr] ->
+            case inet_parse:address(IpStr) of
+                {ok, Ip}        -> Ip;
+                {error, Reason} -> throw({error, Reason})
+            end;
+        [IpStr, NetMask] ->
+            {Type, IpInt} = ip_to_integer(IpStr),
+            MaskInt       = netmask_to_integer(Type, NetMask),
+            case netmask_to_wildcard(Type, MaskInt) of
+                0 ->
+                    integer_to_ip(Type, IpInt);
+                Wildcard when Type =:= ipv4 ->
+                    NetAddr   = (IpInt band MaskInt),
+                    Broadcast = NetAddr + Wildcard,
+                    IpMin     = NetAddr + 1,
+                    IpMax     = Broadcast - 1,
+                    {integer_to_ip(ipv4, IpMin), integer_to_ip(ipv4, IpMax)};
+                Wildcard when Type =:= ipv6 ->
+                    NetAddr   = (IpInt band MaskInt),
+                    IpMin = NetAddr,
+                    IpMax = NetAddr + Wildcard,
+                    {integer_to_ip(ipv6, IpMin), integer_to_ip(ipv6, IpMax)}
+            end;
+        _ ->
+            throw({error, einval})
+    end;
+parse_ipmask(_) ->
+    throw({error, einval}).
+
+
+-define(MAXBITS_IPV4, 32).
+-define(MASK_IPV4,    16#FFFFFFFF).
+-define(MAXBITS_IPV6, 128).
+-define(MASK_IPV6,    16#FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF).
+
+ip_to_integer(Str) when is_list(Str) ->
+    case inet_parse:address(Str) of
+        {ok, Ip}        -> ip_to_integer(Ip);
+        {error, Reason} -> throw({error, Reason})
+    end;
+ip_to_integer({N1,N2,N3,N4}) ->
+    <<Int:32>> = <<N1:8, N2:8, N3:8, N4:8>>,
+    if
+        (Int bsr ?MAXBITS_IPV4) == 0 -> {ipv4, Int};
+        true -> throw({error, einval})
+    end;
+ip_to_integer({N1,N2,N3,N4,N5,N6,N7,N8}) ->
+    <<Int:128>> = <<N1:16, N2:16, N3:16, N4:16, N5:16, N6:16, N7:16, N8:16>>,
+    if
+        (Int bsr ?MAXBITS_IPV6) == 0 -> {ipv6, Int};
+        true -> throw({error, einval})
+    end;
+ip_to_integer(_) ->
+    throw({error, einval}).
+
+integer_to_ip(ipv4, I) when is_integer(I), I =< ?MASK_IPV4 ->
+    <<N1:8, N2:8, N3:8, N4:8>> = <<I:32>>,
+    {N1, N2, N3, N4};
+integer_to_ip(ipv6, I) when is_integer(I), I =< ?MASK_IPV6 ->
+    <<N1:16, N2:16, N3:16, N4:16, N5:16, N6:16, N7:16, N8:16>> = <<I:128>>,
+    {N1, N2, N3, N4, N5, N6, N7, N8};
+integer_to_ip(_, _) ->
+    throw({error, einval}).
+
+netmask_to_integer(Type, NetMask) ->
+    case catch erlang:list_to_integer(NetMask) of
+        I when is_integer(I) ->
+            case Type of
+                ipv4 -> (1 bsl ?MAXBITS_IPV4) - (1 bsl (?MAXBITS_IPV4 - I));
+                ipv6 -> (1 bsl ?MAXBITS_IPV6) - (1 bsl (?MAXBITS_IPV6 - I))
+            end;
+        _ ->
+            case ip_to_integer(NetMask) of
+                {Type, MaskInt} -> MaskInt;
+                _               -> throw({error, einval})
+            end
+    end.
+
+netmask_to_wildcard(ipv4, Mask) -> ((1 bsl ?MAXBITS_IPV4) - 1) bxor Mask;
+netmask_to_wildcard(ipv6, Mask) -> ((1 bsl ?MAXBITS_IPV6) - 1) bxor Mask.
+
+
+%% Compare an ip to another ip or a range of ips
+match_ipmask(Ip, Ip) ->
+    true;
+match_ipmask(Ip, {IpMin, IpMax}) ->
+    case compare_ips(Ip, IpMin) of
+        error -> false;
+        less  -> false;
+        _ ->
+            case compare_ips(Ip, IpMax) of
+                error   -> false;
+                greater -> false;
+                _       -> true
+            end
+    end;
+match_ipmask(_, _) ->
+    false.
+
+compare_ips({A,B,C,D},          {A,B,C,D})                       -> equal;
+compare_ips({A,B,C,D,E,F,G,H},  {A,B,C,D,E,F,G,H})               -> equal;
+compare_ips({A,B,C,D1},         {A,B,C,D2})         when D1 < D2 -> less;
+compare_ips({A,B,C,D1},         {A,B,C,D2})         when D1 > D2 -> greater;
+compare_ips({A,B,C1,_},         {A,B,C2,_})         when C1 < C2 -> less;
+compare_ips({A,B,C1,_},         {A,B,C2,_})         when C1 > C2 -> greater;
+compare_ips({A,B1,_,_},         {A,B2,_,_})         when B1 < B2 -> less;
+compare_ips({A,B1,_,_},         {A,B2,_,_})         when B1 > B2 -> greater;
+compare_ips({A1,_,_,_},         {A2,_,_,_})         when A1 < A2 -> less;
+compare_ips({A1,_,_,_},         {A2,_,_,_})         when A1 > A2 -> greater;
+compare_ips({A,B,C,D,E,F,G,H1}, {A,B,C,D,E,F,G,H2}) when H1 < H2 -> less;
+compare_ips({A,B,C,D,E,F,G,H1}, {A,B,C,D,E,F,G,H2}) when H1 > H2 -> greater;
+compare_ips({A,B,C,D,E,F,G1,_}, {A,B,C,D,E,F,G2,_}) when G1 < G2 -> less;
+compare_ips({A,B,C,D,E,F,G1,_}, {A,B,C,D,E,F,G2,_}) when G1 > G2 -> greater;
+compare_ips({A,B,C,D,E,F1,_,_}, {A,B,C,D,E,F2,_,_}) when F1 < F2 -> less;
+compare_ips({A,B,C,D,E,F1,_,_}, {A,B,C,D,E,F2,_,_}) when F1 > F2 -> greater;
+compare_ips({A,B,C,D,E1,_,_,_}, {A,B,C,D,E2,_,_,_}) when E1 < E2 -> less;
+compare_ips({A,B,C,D,E1,_,_,_}, {A,B,C,D,E2,_,_,_}) when E1 > E2 -> greater;
+compare_ips({A,B,C,D1,_,_,_,_}, {A,B,C,D2,_,_,_,_}) when D1 < D2 -> less;
+compare_ips({A,B,C,D1,_,_,_,_}, {A,B,C,D2,_,_,_,_}) when D1 > D2 -> greater;
+compare_ips({A,B,C1,_,_,_,_,_}, {A,B,C2,_,_,_,_,_}) when C1 < C2 -> less;
+compare_ips({A,B,C1,_,_,_,_,_}, {A,B,C2,_,_,_,_,_}) when C1 > C2 -> greater;
+compare_ips({A,B1,_,_,_,_,_,_}, {A,B2,_,_,_,_,_,_}) when B1 < B2 -> less;
+compare_ips({A,B1,_,_,_,_,_,_}, {A,B2,_,_,_,_,_,_}) when B1 > B2 -> greater;
+compare_ips({A1,_,_,_,_,_,_,_}, {A2,_,_,_,_,_,_,_}) when A1 < A2 -> less;
+compare_ips({A1,_,_,_,_,_,_,_}, {A2,_,_,_,_,_,_,_}) when A1 > A2 -> greater;
+compare_ips(_,                  _)                               -> error.

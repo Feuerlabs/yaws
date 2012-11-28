@@ -603,11 +603,13 @@ gserv_loop(GS, Ready, Rnum, Last) ->
                     {links, Ls} = process_info(self(), links),
                     foreach(fun(X) -> unlink(X), exit(X, shutdown) end, Ls),
                     exit(normal);
-                _ when Reason == failaccept ->
+                Top when Reason == failaccept ->
                     error_logger:format(
                       "Accept proc died, terminate gserv",[]),
                     {links, Ls} = process_info(self(), links),
-                    foreach(fun(X) -> unlink(X), exit(X, shutdown) end, Ls),
+                    %% do not send exit signal to yaws_server process
+                    Ls1 = Ls -- [Top],
+                    foreach(fun(X) -> unlink(X), exit(X, shutdown) end, Ls1),
                     exit(noserver);
                 _ ->
                     GS2 = GS#gs{sessions = GS#gs.sessions - 1},
@@ -832,9 +834,13 @@ stop_ready(Ready, Last) ->
       end, Ready).
 
 gserv_stop(Gpid) ->
-    Gpid ! {self(), stop},
-    receive
-        {Gpid, ok} ->
+    case is_process_alive(Gpid) of
+        true ->
+            Gpid ! {self(), stop},
+            receive
+                {Gpid, ok} -> ok
+            end;
+        false ->
             ok
     end.
 
@@ -1105,7 +1111,7 @@ acceptor0(GS, Top) ->
 %%% Internal functions
 %%%----------------------------------------------------------------------
 
-aloop(CliSock, {IP,Port}, GS, Num) ->
+aloop(CliSock, {IP,Port}=IPPort, GS, Num) ->
     case yaws_trace:get_type(GS#gs.gconf) of
         undefined ->
             ok;
@@ -1135,24 +1141,45 @@ aloop(CliSock, {IP,Port}, GS, Num) ->
             {Req, H} = fix_abs_uri(Req0, H0),
             ?Debug("{Req, H} = ~p~n", [{Req, H}]),
             SC = pick_sconf(GS#gs.gconf, H, GS#gs.group),
-            ?Debug("SC: ~s", [?format_record(SC, sconf)]),
-            ?TC([{record, SC, sconf}]),
-            ?Debug("Headers = ~s~n", [?format_record(H, headers)]),
-            ?Debug("Request = ~s~n", [?format_record(Req, http_request)]),
-            run_trace_filter(GS, IP, Req, H),
             put(outh, #outh{}),
             put(sc, SC),
-            yaws_stats:hit(),
-            check_keepalive_maxuses(GS, Num),
-            Call = case yaws_shaper:check(SC, IP) of
-                       allow ->
-                           call_method(Req#http_request.method,CliSock,
-                                       {IP,Port},Req,H);
-                       {deny, Status, Msg} ->
-                           deliver_xxx(CliSock, Req, Status, Msg)
-                   end,
-            Call2 = fix_keepalive_maxuses(Call),
-            handle_method_result(Call2, CliSock, {IP,Port}, GS, Req, H, Num);
+            DispatchResult = case SC#sconf.dispatch_mod of
+                                 undefined ->
+                                     continue;
+                                 DispatchMod ->
+                                     Arg = make_arg(SC, CliSock, IPPort, H, Req, undefined),
+                                     ok = inet:setopts(CliSock, [{packet, raw}, {active, false}]),
+                                     DispatchMod:dispatch(Arg)
+                             end,
+            case DispatchResult of
+                done ->
+                    erase_transients(),
+                    case exceed_keepalive_maxuses(GS, Num) of
+                        true  -> {ok, Num+1};
+                        false -> aloop(CliSock, IPPort, GS, Num+1)
+                    end;
+                closed ->
+                    %% Dispatcher closed the socket
+                    erase_transients(),
+                    {ok, Num+1};
+                continue ->
+                    ?Debug("SC: ~s", [?format_record(SC, sconf)]),
+                    ?TC([{record, SC, sconf}]),
+                    ?Debug("Headers = ~s~n", [?format_record(H, headers)]),
+                    ?Debug("Request = ~s~n", [?format_record(Req, http_request)]),
+                    run_trace_filter(GS, IP, Req, H),
+                    yaws_stats:hit(),
+                    check_keepalive_maxuses(GS, Num),
+                    Call = case yaws_shaper:check(SC, IP) of
+                               allow ->
+                                   call_method(Req#http_request.method,CliSock,
+                                               IPPort,Req,H);
+                               {deny, Status, Msg} ->
+                                   deliver_xxx(CliSock, Req, Status, Msg)
+                           end,
+                    Call2 = fix_keepalive_maxuses(Call),
+                    handle_method_result(Call2, CliSock, IPPort, GS, Req, H, Num)
+            end;
         closed ->
             case yaws_trace:get_type(GS#gs.gconf) of
                 undefined -> ok;
@@ -1190,15 +1217,15 @@ run_trace_filter(GS, IP, Req, H) ->
 %% process dictionary outh variable if required to say that the
 %% connection has exceeded its maxuses.
 check_keepalive_maxuses(GS, Num) ->
+    Flag = exceed_keepalive_maxuses(GS, Num),
+    put(outh, (get(outh))#outh{exceedmaxuses=Flag}).
+
+exceed_keepalive_maxuses(GS, Num) ->
     case (GS#gs.gconf)#gconf.keepalive_maxuses of
-        nolimit ->
-            ok;
-        0 ->
-            ok;
-        N when Num+1 < N ->
-            ok;
-        _N ->
-            put(outh, (get(outh))#outh{exceedmaxuses=true})
+        nolimit          -> false;
+        0                -> false;
+        N when Num+1 < N -> false;
+        _N               -> true
     end.
 
 %% Change to Res to 'done' if we've exceeded our maxuses.
@@ -1207,7 +1234,7 @@ fix_keepalive_maxuses(Res) ->
         continue ->
             case (get(outh))#outh.exceedmaxuses of
                 true ->
-                    done; %% no keepalive this time!
+                    done;  % no keepalive this time!
                 _ ->
                     Res
             end;
@@ -1479,8 +1506,16 @@ not_implemented(CliSock, _IPPort, Req, Head) ->
 'PUT'(CliSock, IPPort, Req, Head) ->
     ?Debug("PUT Req=~p~n H=~p~n", [?format_record(Req, http_request),
                                    ?format_record(Head, headers)]),
-    body_method(CliSock, IPPort, Req, Head).
-
+    SC=get(sc),
+    case ?sc_has_dav(SC) of
+        true ->
+            %% body is handled by yaws_dav:put/1
+            ok = yaws:setopts(CliSock, [{packet, raw}, binary], yaws:is_ssl(SC)),
+            ARG = make_arg(CliSock, IPPort, Head, Req, undefined),
+            handle_request(CliSock, ARG, 0);
+        false ->
+            body_method(CliSock, IPPort, Req, Head)
+    end.
 
 'DELETE'(CliSock, IPPort, Req, Head) ->
     no_body_method(CliSock, IPPort, Req, Head).
@@ -1499,6 +1534,15 @@ not_implemented(CliSock, _IPPort, Req, Head) ->
     %%                    ?format_record(Head, headers)]),
     body_method(CliSock, IPPort, Req, Head).
 
+'PROPPATCH'(CliSock, IPPort, Req, Head) ->
+     body_method(CliSock, IPPort, Req, Head).
+
+'LOCK'(CliSock, IPPort, Req, Head) ->
+     body_method(CliSock, IPPort, Req, Head).
+
+'UNLOCK'(CliSock, IPPort, Req, Head) ->
+     body_method(CliSock, IPPort, Req, Head).
+
 'MOVE'(CliSock, IPPort, Req, Head) ->
     no_body_method(CliSock, IPPort, Req, Head).
 
@@ -1512,7 +1556,7 @@ body_method(CliSock, IPPort, Req, Head) ->
     PPS = SC#sconf.partial_post_size,
     Res = case Head#headers.content_length of
               undefined ->
-                  case Head#headers.transfer_encoding of
+                  case yaws:to_lower(Head#headers.transfer_encoding) of
                       "chunked" ->
                           get_chunked_client_data(CliSock, yaws:is_ssl(SC));
                       _ ->
@@ -1569,6 +1613,8 @@ no_body_method(CliSock, IPPort, Req, Head) ->
 
 make_arg(CliSock0, IPPort, Head, Req, Bin) ->
     SC = get(sc),
+    make_arg(SC, CliSock0, IPPort, Head, Req, Bin).
+make_arg(SC, CliSock0, IPPort, Head, Req, Bin) ->
     CliSock = case yaws:is_ssl(SC) of
                   nossl ->
                       CliSock0;
@@ -1598,6 +1644,12 @@ handle_extension_method("PATCH", CliSock, IPPort, Req, Head) ->
     'PATCH'(CliSock, IPPort, Req#http_request{method = 'PATCH'}, Head);
 handle_extension_method("PROPFIND", CliSock, IPPort, Req, Head) ->
     'PROPFIND'(CliSock, IPPort, Req, Head);
+handle_extension_method("PROPPATCH", CliSock, IPPort, Req, Head) ->
+    'PROPPATCH'(CliSock, IPPort, Req, Head);
+handle_extension_method("LOCK", CliSock, IPPort, Req, Head) ->
+    'LOCK'(CliSock, IPPort, Req, Head);
+handle_extension_method("UNLOCK", CliSock, IPPort, Req, Head) ->
+    'UNLOCK'(CliSock, IPPort, Req, Head);
 handle_extension_method("MKCOL", CliSock, IPPort, Req, Head) ->
     'MKCOL'(CliSock, IPPort, Req, Head);
 handle_extension_method("MOVE", CliSock, IPPort, Req, Head) ->
@@ -1717,7 +1769,7 @@ handle_request(CliSock, ARG, N) ->
 
                     case {IsRev, IsRedirect} of
                         {_, {true, Redir}} ->
-                            deliver_302_map(CliSock, Req, ARG, Redir);
+                            deliver_redirect_map(CliSock, Req, ARG, Redir);
                         {false, _} ->
                             %%'main' branch so to speak. Most requests
                             %% pass through here.
@@ -1755,7 +1807,6 @@ handle_normal_request(CliSock, ARG, UT, Authdirs, N) ->
                          {true, User} -> {true, set_auth_user(ARG, User)};
                          E            -> {E, ARG}
                      end,
-
     case IsAuth of
         true ->
             %%!todo - remove special treatment of appmod here. (after suitable
@@ -1858,77 +1909,55 @@ is_auth(ARG, Req_dir, H, [Auth_methods|T], {_Ret, Auth_headers}) ->
 
 handle_auth(#arg{client_ip_port={IP,_}}=ARG, Auth_H,
             #auth{acl={AllowIPs, DenyIPs, Order}}=Auth_methods, Ret) ->
-    %% Transform Client IP address in integer
-    IntIP =
-        case IP of
-            undefined ->
-                0;
-            {0,0,0,0,0,16#FFFF,N1,N2} ->
-                (N1 bsl 16) bor N2;
-            {N1,N2,N3,N4} ->
-                (N1 bsl 24) bor (N2 bsl 16) bor (N3 bsl 8) bor N4;
-            {N1,N2,N3,N4,N5,N6,N7,N8} ->
-                (N1 bsl 112) bor (N2 bsl 96) bor (N3 bsl 80) bor (N4 bsl 64) bor
-                    (N5 bsl 48) bor (N6 bsl 32) bor (N7 bsl 16) bor N8
-        end,
-
-    %% Build the match_spec to test ACLs
-    MHead = {'$1', '$2'},
-    Guard = {'andalso',
-             {'=<', '$1', {const, IntIP}},
-             {'>=', '$2', {const, IntIP}}},
-    MSpec = [{MHead, [Guard], [true]}],
-    CMSpec = ets:match_spec_compile(MSpec),
-
+    Fun  = fun(IpMask) -> yaws:match_ipmask(IP, IpMask) end,
     Ret1 = case Auth_methods of
                #auth{users=[],pam=false,mod=[]} -> true;
                _                                -> Ret
            end,
-
     case {AllowIPs, DenyIPs, Order} of
         {_, all, deny_allow} ->
-            case ets:match_spec_run(AllowIPs, CMSpec) of
-                [true|_] ->
+            case lists:any(Fun, AllowIPs) of
+                true ->
                     handle_auth(ARG, Auth_H, Auth_methods#auth{acl=none}, Ret1);
-                _ ->
+                false ->
                     false_403
             end;
         {all, _, deny_allow} ->
             handle_auth(ARG, Auth_H, Auth_methods#auth{acl=none}, Ret1);
         {_, _, deny_allow} ->
-            case ets:match_spec_run(DenyIPs, CMSpec) of
-                [true|_] ->
-                    case ets:match_spec_run(AllowIPs, CMSpec) of
-                        [true|_] ->
+            case lists:any(Fun, DenyIPs) of
+                true ->
+                    case lists:any(Fun, AllowIPs) of
+                        true ->
                             handle_auth(ARG, Auth_H, Auth_methods#auth{acl=none},
                                         Ret1);
-                        _ ->
+                        false ->
                             false_403
                     end;
-                _ ->
+                false ->
                     handle_auth(ARG, Auth_H, Auth_methods#auth{acl=none}, Ret1)
             end;
 
         {_, all, allow_deny} ->
             false_403;
         {all, _, allow_deny} ->
-            case ets:match_spec_run(DenyIPs, CMSpec) of
-                [true|_] ->
+            case lists:any(Fun, DenyIPs) of
+                true ->
                     false_403;
-                _ ->
+                false ->
                     handle_auth(ARG, Auth_H, Auth_methods#auth{acl=none}, Ret1)
             end;
         {_, _, allow_deny} ->
-            case ets:match_spec_run(AllowIPs, CMSpec) of
-                [true|_] ->
-                    case ets:match_spec_run(DenyIPs, CMSpec) of
-                        [true|_] ->
+            case lists:any(Fun, AllowIPs) of
+                true ->
+                    case lists:any(Fun, DenyIPs) of
+                        true ->
                             false_403;
-                        _ ->
+                        false ->
                             handle_auth(ARG, Auth_H, Auth_methods#auth{acl=none},
                                         Ret1)
                     end;
-                _ ->
+                false ->
                     false_403
             end
     end;
@@ -1949,7 +1978,11 @@ handle_auth(ARG, Auth_H, Auth_methods = #auth{mod = Mod}, Ret) when Mod /= [] ->
                    [Mod, ARG, Auth_methods, Reason,
                     erlang:get_stacktrace()]),
             handle_crash(ARG, L),
-            deliver_accumulated(ARG#arg.clisock),
+            CliSock = case yaws_api:get_sslsocket(ARG#arg.clisock) of
+                          {ok, SslSock} -> SslSock;
+                          undefined     -> ARG#arg.clisock
+                      end,
+            deliver_accumulated(CliSock),
             exit(normal);
 
         %% appmod means the auth headers are undefined, i.e. false.
@@ -2027,7 +2060,7 @@ is_redirect_map(_, []) ->
     false;
 is_redirect_map(Path, RedirMap) ->
     case lists:keyfind(Path, 1, RedirMap) of
-        {Path, _Url, _AppendMod}=E ->
+        {Path, _Code, _Url, _AppendMod}=E ->
             {true, E};
         false when Path == "/" ->
             false;
@@ -2318,6 +2351,12 @@ handle_ut(CliSock, ARG, UT = #urltype{type = dav}, N) ->
                 fun(A) -> yaws_dav:delete(A) end;
             Req#http_request.method == "PROPFIND" ->
                 fun(A)-> yaws_dav:propfind(A) end;
+            Req#http_request.method == "PROPPATCH" ->
+                fun(A)-> yaws_dav:proppatch(A) end;
+            Req#http_request.method == "LOCK" ->
+                fun(A)-> yaws_dav:lock(A) end;
+            Req#http_request.method == "UNLOCK" ->
+                fun(A)-> yaws_dav:unlock(A) end;
             Req#http_request.method == "MOVE" ->
                 fun(A)-> yaws_dav:move(A) end;
             Req#http_request.method == "COPY" ->
@@ -2415,66 +2454,75 @@ new_redir_h(OH, Loc, Status) ->
 %% we must deliver a 302 if the browser asks for a dir
 %% without a trailing / in the HTTP req
 %% otherwise the relative urls in /dir/index.html will be broken.
-
-%%!todo - review.
-%% Why is DecPath being tokenized around "?" - only to reassemble??
-%% What happens when Path is not flat?
-
 deliver_302(CliSock, _Req, Arg, Path) ->
     ?Debug("in redir 302 ",[]),
     H = get(outh),
     SC=get(sc),
-    Scheme = yaws:redirect_scheme(SC),
+    Scheme  = yaws:redirect_scheme(SC),
     Headers = Arg#arg.headers,
     DecPath = yaws_api:url_decode(Path),
     RedirHost = yaws:redirect_host(SC, Headers#headers.host),
-    Loc = case string:tokens(DecPath, "?") of
-              [P] ->
-                  ["Location: ", Scheme, RedirHost, P, "\r\n"];
-              [P, Q] ->
-                  ["Location: ", Scheme, RedirHost, P, "?", Q, "\r\n"]
-          end,
 
+    %% QueryString must be added
+    Loc = case Arg#arg.querydata of
+              undefined -> ["Location: ", Scheme, RedirHost, DecPath, "\r\n"];
+              [] -> ["Location: ", Scheme, RedirHost, DecPath, "\r\n"];
+              Q -> ["Location: ", Scheme, RedirHost, DecPath, "?", Q, "\r\n"]
+          end,
     new_redir_h(H, Loc),
     deliver_accumulated(CliSock),
     done_or_continue().
 
 
-deliver_302_map(CliSock, Req, Arg,
-                {_Prefix,URL,Mode})  when is_record(URL,url) ->
-    ?Debug("in redir 302 ",[]),
+deliver_redirect_map(CliSock, Req, _Arg, {_Prefix, Code, undefined, _Mode}) ->
+    %% Here Code is 1xx, 2xx, 4xx or 5xx
+    ?Debug("in redir ~p", [Code]),
+    deliver_xxx(CliSock, Req, Code);
+deliver_redirect_map(_CliSock, Req, _Arg,
+                     {_Prefix, Code, Path, Mode}) when is_list(Path) ->
+    %% Here Code is 1xx, 2xx, 4xx or 5xx
+    ?Debug("in redir ~p", [Code]),
+    DecPath = safe_decode_path(Req#http_request.path),
+    Page = if
+               Mode == append ->
+                   filename:join([Path ++ DecPath]);
+               true -> %% noappend
+                   case yaws:split_at(DecPath, $?) of
+                       {_, []} -> Path;
+                       {_, Q}  -> Path ++ "?" ++ Q
+                   end
+           end,
+    {page, {[{status, Code}], Page}};
+deliver_redirect_map(CliSock, Req, Arg,
+                     {_Prefix, Code, URL, Mode}) when is_record(URL, url) ->
+    %% Here Code is 3xx
+    ?Debug("in redir ~p", [Code]),
     H = get(outh),
     DecPath = safe_decode_path(Req#http_request.path),
-    {P, Q} = yaws:split_at(DecPath, $?),
-    LocPath = yaws_api:format_partial_url(URL, get(sc)),
     Loc = if
               Mode == append ->
-                  Newpath = filename:join([URL#url.path ++ P]),
-                  NLocPath = yaws_api:format_partial_url(
-                               URL#url{path = Newpath}, get(sc)),
-                  case Q of
-                      [] ->
-                          ["Location: ", NLocPath, "\r\n"];
-                      _Q ->
-                          ["Location: ", NLocPath, "?", Q, "\r\n"]
-                  end;
-              Mode == noappend,Q == [] ->
+                  NPath   = filename:join([URL#url.path ++ DecPath]),
+                  LocPath = yaws_api:format_partial_url(URL#url{path=NPath},
+                                                        get(sc)),
                   ["Location: ", LocPath, "\r\n"];
-              Mode == noappend,Q /= [] ->
-                  ["Location: ", LocPath, "?", Q, "\r\n"]
+              true -> %% noappend
+                  LocPath = yaws_api:format_partial_url(URL, get(sc)),
+                  case yaws:split_at(DecPath, $?) of
+                      {_, []} -> ["Location: ", LocPath, "\r\n"];
+                      {_, Q}  -> ["Location: ", LocPath, "?", Q, "\r\n"]
+                  end
           end,
-    Headers = Arg#arg.headers,
-    {DoClose, _Chunked} = yaws:dcc(Req, Headers),
+    {DoClose, _Chunked} = yaws:dcc(Req, Arg#arg.headers),
     new_redir_h(H#outh{
-                  connection  = yaws:make_connection_close_header(DoClose),
-                  doclose = DoClose,
-                  server = yaws:make_server_header(),
-                  chunked = false,
-                  date = yaws:make_date_header()
-                 }, Loc),
-
+                  connection = yaws:make_connection_close_header(DoClose),
+                  doclose    = DoClose,
+                  server     = yaws:make_server_header(),
+                  chunked    = false,
+                  date       = yaws:make_date_header()
+                 }, Loc, Code),
     deliver_accumulated(CliSock),
     done_or_continue().
+
 
 deliver_options(CliSock, _Req, Options) ->
     H = #outh{status = 200,
@@ -2614,7 +2662,8 @@ get_chunked_client_data(CliSock,SSL) ->
                   undefined;
               Val =:= undefined ->
                   yaws:setopts(CliSock, [binary, {packet, line}],SSL),
-                  N = yaws:get_chunk_num(CliSock,SSL),
+                  %% Ignore chunk extentions
+                  {N, _Exts} = yaws:get_chunk_header(CliSock, SSL),
                   yaws:setopts(CliSock, [binary, {packet, raw}],SSL),
                   N;
               true ->
@@ -2627,7 +2676,8 @@ get_chunked_client_data(CliSock,SSL) ->
             <<>>;
         Len == 0 ->
             put(current_chunk_size, 0),
-            _Tmp=yaws:do_recv(CliSock, 2, SSL),%% flush last crnl
+            %% Ignore chunk trailer
+            yaws:get_chunk_trailer(CliSock, SSL),
             <<>>;
         Len =< SC#sconf.partial_post_size ->
             B = yaws:get_chunk(CliSock, Len, 0, SSL),
@@ -2663,7 +2713,7 @@ deliver_dyn_part(CliSock,                       % essential params
     case OutReply of
         {get_more, Cont, State} when element(1, Arg#arg.clidata) == partial  ->
             CliDataPos1 = get(client_data_pos),
-            More = get_more_post_data(CliDataPos1, Arg),
+            More = get_more_post_data(CliSock, CliDataPos1, Arg),
             A2 = Arg#arg{clidata=More, cont=Cont, state=State},
             deliver_dyn_part(
               CliSock, LineNo, YawsFile, CliDataPos1+size(un_partial(More)),
@@ -3029,7 +3079,10 @@ handle_out_reply({yssi, Yfile}, LineNo, YawsFile, UT, ARG) ->
         yaws ->
             Mtime = mtime(UT2#urltype.finfo),
             Key = UT2#urltype.getpath,
-            CliSock = ARG#arg.clisock,
+            CliSock = case yaws_api:get_sslsocket(ARG#arg.clisock) of
+                          {ok, SslSock} -> SslSock;
+                          undefined     -> ARG#arg.clisock
+                      end,
             N = 0,
             case ets:lookup(SC#sconf.ets, Key) of
                 [{_Key, spec, Mtime1, Spec, Es}] when Mtime1 == Mtime,
@@ -3278,10 +3331,15 @@ handle_out_reply(Arg = #arg{},  _LineNo, _YawsFile, _UT, _ARG) ->
     Arg;
 
 handle_out_reply(flush, _LineNo, _YawsFile, _UT, ARG) ->
+    CliSock = case yaws_api:get_sslsocket(ARG#arg.clisock) of
+                  {ok, SslSock} -> SslSock;
+                  undefined     -> ARG#arg.clisock
+              end,
+    Hdrs = ARG#arg.headers,
     CliDataPos0 = get(client_data_pos),
-    CliDataPos1 = flush(ARG#arg.clisock, CliDataPos0,
-                        (ARG#arg.headers)#headers.content_length,
-                        (ARG#arg.headers)#headers.transfer_encoding),
+    CliDataPos1 = flush(CliSock, CliDataPos0,
+                        Hdrs#headers.content_length,
+                        yaws:to_lower(Hdrs#headers.transfer_encoding)),
     put(client_data_pos, CliDataPos1),
     ok;
 
@@ -3683,24 +3741,24 @@ deflate_accumulated(Arg, Content, ContentLength, Mode) ->
     end.
 
 
-get_more_post_data(PPS, ARG) ->
+get_more_post_data(CliSock, PPS, ARG) ->
     SC = get(sc),
     N = SC#sconf.partial_post_size,
     case (ARG#arg.headers)#headers.content_length of
         undefined ->
-            case (ARG#arg.headers)#headers.transfer_encoding of
+            case yaws:to_lower((ARG#arg.headers)#headers.transfer_encoding) of
                 "chunked" ->
-                    get_chunked_client_data(ARG#arg.clisock, yaws:is_ssl(SC));
+                    get_chunked_client_data(CliSock, yaws:is_ssl(SC));
                 _  ->
                     <<>>
             end;
         Len ->
             Int_len = list_to_integer(Len),
             if N + PPS < Int_len ->
-                    Bin = get_client_data(ARG#arg.clisock, N, yaws:is_ssl(SC)),
+                    Bin = get_client_data(CliSock, N, yaws:is_ssl(SC)),
                     {partial, Bin};
                true ->
-                    get_client_data(ARG#arg.clisock, Int_len - PPS,
+                    get_client_data(CliSock, Int_len - PPS,
                                     yaws:is_ssl(SC))
             end
     end.
@@ -3844,7 +3902,7 @@ deliver_large_file(CliSock,  _Req, UT, Range) ->
 
 send_file(CliSock, Path, all, undefined) when is_port(CliSock) ->
     ?Debug("send_file(~p,~p,no ...)~n", [CliSock, Path]),
-    {ok, Size} = yaws_sendfile:send(CliSock, Path),
+    Size = yaws_sendfile:send(CliSock, Path),
     yaws_stats:sent(Size);
 send_file(CliSock, Path, all, undefined) ->
     ?Debug("send_file(~p,~p,no ...)~n", [CliSock, Path]),
@@ -3852,7 +3910,7 @@ send_file(CliSock, Path, all, undefined) ->
     send_file(CliSock, Fd, undefined);
 send_file(CliSock, _, all, {gzfile, GzFile}) when is_port(CliSock) ->
     ?Debug("send_file(~p,~p, ...)~n", [CliSock, GzFile]),
-    {ok, Size} = yaws_sendfile:send(CliSock, GzFile),
+    Size = yaws_sendfile:send(CliSock, GzFile),
     yaws_stats:sent(Size);
 send_file(CliSock, _, all, {gzfile, GzFile}) ->
     ?Debug("send_file(~p,~p, ...)~n", [CliSock, GzFile]),
@@ -3863,7 +3921,7 @@ send_file(CliSock, Path, all, Priv) ->
     {ok, Fd} = file:open(Path, [raw, binary, read]),
     send_file(CliSock, Fd, Priv);
 send_file(CliSock, Path,  {fromto, From, To, _Tot}, _) when is_port(CliSock) ->
-    {ok, Size} = yaws_sendfile:send(CliSock, Path, From, (To-From+1)),
+    Size = yaws_sendfile:send(CliSock, Path, From, (To-From+1)),
     yaws_stats:sent(Size);
 send_file(CliSock, Path,  {fromto, From, To, _Tot}, _) ->
     {ok, Fd} = file:open(Path, [raw, binary, read]),

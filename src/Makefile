@@ -42,6 +42,7 @@ MODULES=yaws \
 	yaws_log_file_h \
 	yaws_rss \
 	yaws_dav \
+	yaws_davlock \
 	yaws_pam \
 	json json2 jsonrpc yaws_jsonrpc yaws_xmlrpc\
 	haxe yaws_rpc \
@@ -101,9 +102,7 @@ charset.def:
            echo $(DEFAULT_CHARSET) > ../priv/charset.def; \
 	else rm -f ../priv/charset.def ; touch ../priv/charset.def; fi
 
-mime_type_c.beam: mime_type_c.erl
-
-mime_types.erl: charset.def mime_type_c.beam
+mime_types.erl: charset.def ../ebin/mime_type_c.beam
 	$(ERL) -noshell -pa ../ebin -s mime_type_c generate
 
 debug:

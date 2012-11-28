@@ -2384,12 +2384,13 @@ The following directives are allowed inside a server definition.
               This makes the server listen on Port. Default is 8000.
 
 \item        \verb+listen = IpAddress+ ---
-              This makes the  server  listen  on  \verb+IpAddress+  when
-              virthosting  several  servers  on  the same IP/port
-              address, if the browser doesn't send a \verb+Host:+ field,
-              \Yaws\   will  pick  the first server specified in the
-              config file. Multiple \verb+listen+ directives may be
-              used to specify several addresses to listen on.
+              This makes the server listen on \verb+IpAddress+ when
+              virthosting several servers on the same IP/port address, if
+              the browser doesn't send a \verb+Host:+ field, \Yaws\ will
+              pick the first server specified in the config file. Multiple
+              \verb+listen+ directives may be used to specify several
+              addresses to listen on. The default listen interface is
+              127.0.0.1.
 
 \item        \verb+listen_backlog = Integer+ ---
               This sets the TCP listen backlog for the server to
@@ -2622,18 +2623,17 @@ The following directives are allowed inside a server definition.
               prohibitive when \Yaws\  starts up. Defaults to false.
 
 \item       \verb+partial_post_size = Integer+ ---
-              When a \Yaws\  file receives large  \verb+POST+s,  the
-              amount  of  data  received  in each chunk is
-              determined by the this parameter.  The default
-              value is 10240.
+              When a \Yaws\ file receives large \verb+POST+s, the amount of data
+              received in each chunk is determined by the this parameter.  The
+              default value is 10240. Setting it to nolimit is potentially
+              dangerous.
 
 \item       \verb+dav = true | false+ ---
               Turns on the DAV protocol for this server. The dav support in
               \Yaws\ is highly limited. If dav is turned on, .yaws processing of
-              .yaws pages is turned off. Default is false. Setting it to nolimit
-              is potentially dangerous. The socket read timeout is supplied by
-              the keepalive\_timeout setting. If the read is not done within the
-              timeout, the POST will fail.
+              .yaws pages is turned off. Default is false. The socket read
+              timeout is supplied by the keepalive\_timeout setting. If the read
+              is not done within the timeout, the POST will fail.
 
 \item       \verb+tilde_expand = true|false+ ---
               If  this  value  is  set  to false \Yaws\  will
@@ -2690,6 +2690,30 @@ The following directives are allowed inside a server definition.
              The above configuration will invoke the \verb+myapp+ erlang module
              on everything except any file found in directories \verb+icons+,
              \verb+js+ and \verb+top/static+ relative to the docroot.
+
+\item       \verb+dispatchmod = DispatchModule+ ---
+              Set \verb+DispatchModule+ as a server-specific request
+              dispatching module. \Yaws\  expects \verb+DispatchModule+ to
+              export a \verb+dispatch/1+ function. When it receives a
+              request, \Yaws\  passes an \verb+#arg{}+ record to the dispatch
+              module's \verb+dispatch/1+ function, which returns one of the
+              following atom results:
+              \begin{itemize}
+                \item \verb+done+ --- this indicates the dispatch module
+                  handled the request itself and already sent the response,
+                  and \Yaws\  should resume watching for new requests on the
+                  connection
+                \item \verb+closed+ --- same as \verb+done+ but the
+                  \verb+DispatchModule+ also closed the connection
+                \item \verb+continue+ --- the dispatch module has decided
+                  not to handle the request, and instead wants \Yaws\  to
+                  perform its regular request dispatching
+              \end{itemize}
+              Note that when \verb+DispatchModule+ handles a request itself,
+              \Yaws\  does not support tracing, increment statistics
+              counters or allow traffic shaping for that request. It does
+              however still keep track of maximum keepalive uses on the
+              connection.
 
 \item       \verb+errormod_404 = Module+ ---
               It is possible to set a special module that handles 404 Not Found
@@ -2995,14 +3019,25 @@ The following directives are allowed inside a server definition.
 
 \item       \verb+<redirect> ... </redirect>+ ---
               Defines a redirect mapping. The following items are allowed within
-              a matching pair of \verb+<redirect>+ and \verb+</redirect>+ delimiters.
+              a matching pair of \verb+<redirect>+ and \verb+</redirect>+
+              delimiters.
 
-              We can have a series of \verb+Path = URL+ or \verb+Path = file+
+              We can have a series of redirect rules in one of formats below:
+\begin{verbatim}
+  Path = URL
+  Path = code
+  Path = code URL
+\end{verbatim}
+              \verb+Path+ must begin with a slash. \verb+URL+ may be either a
+              relative URL (a path beginning with a slash), or an absolute
+              URL. In the first case, the \textit{scheme:hostname:port} of the
+              current server will be added. All accesses to \verb+Path+ will be
+              redirected to \verb+URL/Path+ (or
+              \verb+scheme:hostname:port/URL/Path+ if \verb+URL+ is
+              relative). Note that the original path is appended to the
+              redirected URL.
 
-              All accesses to \verb+Path+ will be redirected to \verb+URL/Path+
-              or to \verb+scheme:host:port/file/Path+ if a file is
-              used. Note that the original path is appended to the redirected
-              url. So if we for example have:
+              For example, assume we have the following redirect configuration:
 \begin{verbatim}
   <redirect>
     /foo = http://www.mysite.org/zapp
@@ -3010,16 +3045,28 @@ The following directives are allowed inside a server definition.
   </redirect>
 \end{verbatim}
               Assuming this config resides on a site called
-              \url{http://abc.com}, We have the following redirects:
+              \url{http://abc.com}, we have the following redirects:
 \begin{verbatim}
   http://abc.com/foo -> http://www.mysite.org/zapp/foo
-
   http://abc.com/foo/test -> http://www.mysite.org/zapp/foo/test
-
-  http://abc.com/bar -> http://abc.com/bar
-
-  http://abc.com/bar/x/y/z -> http://abc.com/bar/x/y/z
+  http://abc.com/bar -> http://abc.com/tomato.html/bar
+  http://abc.com/bar/x/y/z -> http://abc.com/tomato.html/bar/x/y/z
 \end{verbatim}
+
+              By default, \Yaws\ will perform a 302 redirect. The HTTP
+              status code can be changed using the \verb+code+
+              parameter. Note that \Yaws\ must have knowledge of the status
+              code value.
+              \begin{itemize}
+              \item For 3xx status codes, the \verb+URL+ parameter must be
+                present and will be used to build the new location.
+              \item For other status codes (1xx, 2xx, 4xx and 5xx), the
+                \verb+URL+ can be omitted. In the absence of \verb+URL+,
+                \Yaws\ will return a generic response with the specified
+                status code.
+              \item Otherwise, the \verb+URL+ parameter must be a relative
+                URL and will be used to customize the response.
+              \end{itemize}
               Sometimes we do not want to have the original path appended to the
               redirected path. To get that behaviour we specify the config with
               '==' instead of '='.
@@ -3030,13 +3077,13 @@ The following directives are allowed inside a server definition.
   </redirect>
 \end{verbatim}
               With this configuration, a request for
-              \url{http://abc.com/foo/x/y/z} simply gets redirected to
+              \url{http://abc.com/foo/x/y/z} simply gets redirected to \\
               \url{http://www.mysite.org/zapp}. This is typically used when
               we simply want a static redirect at some place in the
               docroot.
 
-              When we specify a file as target for the redirect, the redir will
-              be to the current http(s) server.
+              When we specify a relative URL as the target for the
+              redirect, the redirect will be to the current http(s) server.
 
 \item       \verb+<auth> ... </auth>+ ---
               Defines an auth structure.  The following items are allowed within
@@ -3146,10 +3193,10 @@ The following directives are allowed inside a server definition.
                     denied by default.
 
                   \item \verb+deny,allaw+ --- First, all \verb+deny+ directives
-                    are evaluated; if any match, the request is denied unless it
-                    also matches an \verb+allow+ directive. Any requests which
-                    do not match any \verb+allow+ or \verb+deny+ directives are
-                    permitted.
+                    are evaluated; if any matches, the request is denied unless
+                    it also matches an \verb+allow+ directive. Any requests
+                    which do not match any \verb+allow+ or \verb+deny+
+                    directives are permitted.
                 \end{itemize}
               \end{itemize}
 

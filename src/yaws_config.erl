@@ -13,7 +13,6 @@
 -include("../include/yaws_api.hrl").
 -include("yaws_debug.hrl").
 
-
 -include_lib("kernel/include/file.hrl").
 
 -export([load/1,
@@ -528,7 +527,15 @@ make_default_sconf([], Port) ->
 make_default_sconf(DocRoot, undefined) ->
     make_default_sconf(DocRoot, 8000);
 make_default_sconf(DocRoot, Port) ->
-    set_server(#sconf{port=Port, listen={127,0,0,1}, docroot=DocRoot}).
+    AbsDocRoot = filename:absname(DocRoot),
+    case is_dir(AbsDocRoot) of
+        true ->
+            set_server(#sconf{port=Port,listen={127,0,0,1},docroot=AbsDocRoot});
+        false ->
+            throw({error, ?F("Invalid docroot: directory ~s does not exist",
+                             [AbsDocRoot])})
+    end.
+
 
 yaws_dir() ->
     %% below, ignore dialyzer warning:
@@ -633,10 +640,11 @@ fload(FD, globals, GC, C, Cs, Lno, Chars) ->
                 true ->
                     case file:list_dir(Dir) of
                         {ok, Names} ->
+                            Sorted = lists:sort(Names),
                             Paths = lists:map(
                                       fun(N) ->
                                               filename:absname(N, Dir)
-                                      end, Names),
+                                      end, Sorted),
                             Fold = lists:foldl(
                                      fun subconfigdir_fold/2,
                                      {ok, GC, Cs}, Paths),
@@ -1221,6 +1229,10 @@ fload(FD, server, GC, C, Cs, Lno, Chars) ->
                 {error, Str} ->
                     {error, ?F("~s at line ~w", [Str, Lno])}
             end;
+        ["dispatchmod", '=', DispatchMod] ->
+            C2 = C#sconf{dispatch_mod = list_to_atom(DispatchMod)},
+            fload(FD, server, GC, C2, Cs, Lno+1, Next);
+
         ["expires", '=' | Expires] ->
             case parse_expires(Expires, []) of
                 {ok, L} ->
@@ -1471,9 +1483,8 @@ fload(FD, server, GC, C, Cs, Lno, Chars) ->
     end;
 
 
-
 fload(FD, ssl, GC, C, Cs, Lno, Chars) ->
-    Next = io:get_line(FD, ''),
+    Next = io_get_line(FD, '', []),
     case toks(Lno, Chars) of
         [] ->
             fload(FD, ssl, GC, C, Cs, Lno+1, Next);
@@ -1565,13 +1576,28 @@ fload(FD, ssl, GC, C, Cs, Lno, Chars) ->
                                [Lno])}
             end;
         ["ciphers", '=', Val] ->
-            if
-                is_record(C#sconf.ssl, ssl) ->
-                    C2 = C#sconf{ssl = (C#sconf.ssl)#ssl{ciphers = Val}},
-                    fload(FD, ssl, GC, C2, Cs, Lno+1, Next);
-                true ->
-                    {error, ?F("Need to set option ssl to true before line ~w",
-                               [Lno])}
+            try
+                L = str2term(Val),
+                io:format("L = ~p~n",[L]),
+                Ciphers = ssl:cipher_suites(),
+                case check_ciphers(L, Ciphers) of
+                    ok ->
+                        if
+                            is_record(C#sconf.ssl, ssl) ->
+                                C2 = C#sconf{ssl = (C#sconf.ssl)#ssl{
+                                                     ciphers = L}},
+                                fload(FD, ssl, GC, C2, Cs, Lno+1, Next);
+                            true ->
+                                {error, ?F("Need to set option ssl to "
+                                           "true before line ~w",
+                                           [Lno])}
+                        end;
+                    Err ->
+                        Err
+                end
+            catch _:Err2 ->
+                    io:format("~p~n", [Err2]),
+                    {error, ?F("Bad cipherspec at line ~w", [Lno])}
             end;
         ['<', "/ssl", '>'] ->
             fload(FD, server, GC, C, Cs, Lno+1, Next);
@@ -1782,21 +1808,25 @@ fload(FD, server_redirect, GC, C, Cs, Lno, Chars, RedirMap) ->
     case Toks of
         [] ->
             fload(FD, server_redirect, GC, C, Cs, Lno+1, Next, RedirMap);
-        [Path, '=', URL] ->
-            try yaws_api:parse_url(URL, sloppy) of
-                U when is_record(U, url) ->
+        [Path, '=', '=' | Rest] ->
+            %% "Normalize" Path
+            Path1 = filename:join([yaws_api:path_norm(Path)]),
+            case parse_redirect(Path1, Rest, noappend, Lno) of
+                {error, Str} ->
+                    {error, Str};
+                Redir ->
                     fload(FD, server_redirect, GC, C, Cs, Lno+1, Next,
-                          [{Path, U, append}|RedirMap])
-            catch _:_ ->
-                    {error, ?F("bad redir ~p at line ~w", [URL, Lno])}
+                          [Redir|RedirMap])
             end;
-        [Path, '=', '=', URL] ->
-            try yaws_api:parse_url(URL, sloppy) of
-                U when is_record(U, url) ->
+        [Path, '=' | Rest] ->
+            %% "Normalize" Path
+            Path1 = filename:join([yaws_api:path_norm(Path)]),
+            case parse_redirect(Path1, Rest, append, Lno) of
+                {error, Str} ->
+                    {error, Str};
+                Redir ->
                     fload(FD, server_redirect, GC, C, Cs, Lno+1, Next,
-                          [{Path, U, noappend}|RedirMap])
-            catch _:_ ->
-                    {error, ?F("Bad redir ~p at line ~w", [URL, Lno])}
+                          [Redir|RedirMap])
             end;
         ['<', "/redirect", '>'] ->
             C2 = C#sconf{redirect_map = lists:reverse(RedirMap)},
@@ -2047,7 +2077,7 @@ is_string_char([C|T]) ->
     end.
 
 is_special(C) ->
-    lists:member(C, [$=, $<, $>, $,]).
+    lists:member(C, [$=, $[, $], ${, $}, $, ,$<, $>, $,]).
 
 %% parse the argument string PLString which can either be the undefined
 %% atom or a proplist. Currently the only supported keys are
@@ -2327,6 +2357,52 @@ parse_mime_types_info(add_charsets, NewCharsets, Info) ->
         {ok, Charsets} -> {ok, Info#mime_types_info{charsets=Charsets}};
         Error          -> Error
     end.
+
+
+parse_redirect(Path, [Code, URL], Mode, Lno) ->
+    case catch list_to_integer(Code) of
+        I when is_integer(I), I >= 300, I =< 399 ->
+            try yaws_api:parse_url(URL, sloppy) of
+                U when is_record(U, url) ->
+                    {Path, I, U, Mode}
+            catch _:_ ->
+                    {error, ?F("Bad redirect URL ~p at line ~w", [URL, Lno])}
+            end;
+        I when is_integer(I), I >= 100, I =< 599 ->
+            %% Only relative path are authorized here
+            try yaws_api:parse_url(URL, sloppy) of
+                #url{scheme=undefined, host=[], port=undefined, path=P} ->
+                    {Path, I, P, Mode};
+                #url{} ->
+                    {error, ?F("Bad redirect rule at line ~w: "
+                               " Absolute URL is forbidden here", [URL])}
+            catch _:_ ->
+                    {error, ?F("Bad redirect URL ~p at line ~w", [URL, Lno])}
+            end;
+        _ ->
+            {error, ?F("Bad status code ~p at line ~w", [Code, Lno])}
+    end;
+parse_redirect(Path, [CodeOrUrl], Mode, Lno) ->
+    case catch list_to_integer(CodeOrUrl) of
+        I when is_integer(I), I >= 300, I =< 399 ->
+            {error, ?F("Bad redirect rule at line ~w: "
+                       "URL to redirect to is missing ", [Lno])};
+        I when is_integer(I), I >= 100, I =< 599 ->
+            {Path, I, undefined, Mode};
+        I when is_integer(I) ->
+            {error, ?F("Bad status code ~p at line ~w", [CodeOrUrl, Lno])};
+        _ ->
+            try yaws_api:parse_url(CodeOrUrl, sloppy) of
+                #url{}=U ->
+                    {Path, 302, U, Mode}
+            catch _:_ ->
+                    {error, ?F("Bad redirect URL ~p at line ~w",
+                               [CodeOrUrl, Lno])}
+            end
+    end;
+parse_redirect(_Path, _, _Mode, Lno) ->
+    {error, ?F("Bad redirect rule at line ~w", [Lno])}.
+
 
 
 ssl_start() ->
@@ -2675,80 +2751,15 @@ update_gconf(GC) ->
     ok = gen_server:call(yaws_server, {update_gconf, GC}, infinity).
 
 
--define(MAXBITS_IPV4, 32).
--define(MAXBITS_IPV6, 128).
-
 parse_auth_ips([], Result) ->
     Result;
 parse_auth_ips([Str|Rest], Result) ->
     try
-        parse_auth_ips(Rest, [parse_ip(Str)|Result])
+        parse_auth_ips(Rest, [yaws:parse_ipmask(Str)|Result])
     catch
         _:_ -> parse_auth_ips(Rest, Result)
     end.
 
-parse_ip(Str) when is_list(Str) ->
-    [Ip|Rest] = string:tokens(Str, [$/]),
-    {Type, IpInt}  = ip_to_integer(Ip),
-    case Rest of
-        [] ->
-            {IpInt, IpInt};
-        [NetMask] ->
-            MaskInt  = netmask_to_integer(Type, NetMask),
-            WildCard = netmask_to_wildcard(Type, MaskInt),
-            NetAddr  = IpInt band MaskInt,
-            case Type of
-                ipv4 -> {NetAddr + 1, NetAddr + WildCard - 1};
-                ipv6 -> {NetAddr, NetAddr + WildCard}
-            end;
-        _ ->
-            throw({error, einval})
-    end;
-parse_ip(_) ->
-    throw({error, einval}).
-
-ip_to_integer(Str) when is_list(Str) ->
-    case inet_parse:ipv6_address(Str) of
-        {ok, {0,0,0,0,0,16#FFFF,N1,N2}} ->
-            {ipv4, (N1 bsl 16) bor N2};
-        {ok, Ip} ->
-            ip_to_integer(Ip);
-        {error, Reason} ->
-            throw({error, Reason})
-    end;
-ip_to_integer({N1,N2,N3,N4}) ->
-    Int = (N1 bsl 24) bor (N2 bsl 16) bor (N3 bsl 8) bor N4,
-    if
-        (Int bsr ?MAXBITS_IPV4) == 0 -> {ipv4, Int};
-        true -> throw({error, einval})
-    end;
-ip_to_integer({N1,N2,N3,N4,N5,N6,N7,N8}) ->
-    Int = (N1 bsl 112) bor (N2 bsl 96) bor (N3 bsl 80) bor (N4 bsl 64) bor
-        (N5 bsl 48) bor (N6 bsl 32) bor (N7 bsl 16) bor N8,
-    if
-        (Int bsr ?MAXBITS_IPV6) == 0 -> {ipv6, Int};
-        true -> throw({error, einval})
-    end;
-ip_to_integer(_) ->
-    throw({error, einval}).
-
-
-netmask_to_integer(Type, NetMask) ->
-    case catch list_to_integer(NetMask) of
-        I when is_integer(I) ->
-            case Type of
-                ipv4 -> (1 bsl ?MAXBITS_IPV4) - (1 bsl (?MAXBITS_IPV4 - I));
-                ipv6 -> (1 bsl ?MAXBITS_IPV6) - (1 bsl (?MAXBITS_IPV6 - I))
-            end;
-        _ ->
-            case ip_to_integer(NetMask) of
-                {Type, MaskInt} -> MaskInt;
-                _               -> throw({error, einval})
-            end
-    end.
-
-netmask_to_wildcard(ipv4, Mask) -> ((1 bsl ?MAXBITS_IPV4) - 1) bxor Mask;
-netmask_to_wildcard(ipv6, Mask) -> ((1 bsl ?MAXBITS_IPV6) - 1) bxor Mask.
 
 subconfigdir_fold(_File, {error, _Err}=Acc) ->
     Acc;
@@ -2773,4 +2784,39 @@ subconfigdir_fold(File, {ok, GCp, Csp}=Acc) ->
         false ->
             %% Ignore subdirectories
             Acc
+    end.
+
+str2term(Str0) ->
+    Str=Str0++".",
+    {ok,Tokens,_EndLine} = erl_scan:string(Str),
+    {ok,AbsForm} = erl_parse:parse_exprs(Tokens),
+    {value,Value,_Bs} = erl_eval:exprs(AbsForm, erl_eval:new_bindings()),
+    Value.
+
+check_ciphers([], _) ->
+    ok;
+check_ciphers([Spec|Specs], L) ->
+    case lists:member(Spec, L) of
+        true ->
+            check_ciphers(Specs, L);
+        false ->
+            {error, ?F("Bad cipherspec ~p",[Spec])}
+    end;
+check_ciphers(X,_) ->
+    {error, ?F("Bad cipherspec ~p",[X])}.
+
+
+
+io_get_line(FD, Prompt, Acc) ->
+    Next = io:get_line(FD, Prompt),
+    if
+        is_list(Next) ->
+            case lists:reverse(Next) of
+                [$\n, $\\ |More] ->
+                    io_get_line(FD, Prompt, Acc ++ lists:reverse(More));
+                _ ->
+                    Acc ++ Next
+            end;
+        true ->
+            Next
     end.
