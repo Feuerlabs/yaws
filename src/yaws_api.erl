@@ -8,9 +8,6 @@
 -module(yaws_api).
 -author('klacke@hyber.org').
 
-%% -compile(export_all).
-
-
 -include("../include/yaws.hrl").
 -include("../include/yaws_api.hrl").
 -include("yaws_debug.hrl").
@@ -52,6 +49,7 @@
 
 -export([getconf/0,
          setconf/2,
+         get_listen_port/1,
          embedded_start_conf/1, embedded_start_conf/2,
          embedded_start_conf/3, embedded_start_conf/4]).
 
@@ -77,22 +75,27 @@
          dir_listing/1, dir_listing/2, redirect_self/1]).
 
 -export([arg_clisock/1, arg_client_ip_port/1, arg_headers/1, arg_req/1,
-         arg_clidata/1, arg_server_path/1, arg_querydata/1, arg_appmoddata/1,
-         arg_docroot/1, arg_docroot_mount/1, arg_fullpath/1, arg_cont/1,
-         arg_state/1, arg_pid/1, arg_opaque/1, arg_appmod_prepath/1, arg_prepath/1,
+         arg_orig_req/1, arg_clidata/1, arg_server_path/1, arg_querydata/1,
+         arg_appmoddata/1, arg_docroot/1, arg_docroot_mount/1, arg_fullpath/1,
+         arg_cont/1, arg_state/1, arg_pid/1, arg_opaque/1, arg_appmod_prepath/1,
+         arg_prepath/1,
          arg_pathinfo/1]).
 -export([http_request_method/1, http_request_path/1, http_request_version/1,
-         http_response_version/1, http_response_status/1, http_response_phrase/1,
+         http_response_version/1, http_response_status/1,
+         http_response_phrase/1,
          headers_connection/1, headers_accept/1, headers_host/1,
-         headers_if_modified_since/1, headers_if_match/1, headers_if_none_match/1,
+         headers_if_modified_since/1, headers_if_match/1,
+         headers_if_none_match/1,
          headers_if_range/1, headers_if_unmodified_since/1, headers_range/1,
          headers_referer/1, headers_user_agent/1, headers_accept_ranges/1,
          headers_cookie/1, headers_keep_alive/1, headers_location/1,
          headers_content_length/1, headers_content_type/1,
          headers_content_encoding/1, headers_authorization/1,
-         headers_transfer_encoding/1, headers_x_forwarded_for/1, headers_other/1]).
+         headers_transfer_encoding/1, headers_x_forwarded_for/1,
+         headers_other/1]).
 
--export([set_header/2, set_header/3, get_header/2, get_header/3, delete_header/2]).
+-export([set_header/2, set_header/3, merge_header/2, merge_header/3,
+         get_header/2, get_header/3, delete_header/2]).
 
 -import(lists, [flatten/1, reverse/1]).
 
@@ -103,6 +106,7 @@ arg_clisock(#arg{clisock = X}) -> X.
 arg_client_ip_port(#arg{client_ip_port = X}) -> X.
 arg_headers(#arg{headers = X}) -> X.
 arg_req(#arg{req = X}) -> X.
+arg_orig_req(#arg{orig_req = X}) -> X.
 arg_clidata(#arg{clidata = X}) -> X.
 arg_server_path(#arg{server_path = X}) -> X.
 arg_querydata(#arg{querydata = X}) -> X.
@@ -303,6 +307,8 @@ parse_arg_key([C|Line], Key, Value) ->
 
 parse_arg_value([], Key, Value, _, _) ->
     make_parse_line_reply(Key, Value, []);
+parse_arg_value([$\\,$"], Key, Value, _, _) ->
+    make_parse_line_reply(Key, [$\\|Value], []);
 parse_arg_value([$\\,$"|Line], Key, Value, Quote, Begun) ->
     parse_arg_value(Line, Key, [$"|Value], Quote, Begun);
 parse_arg_value([$"|Line], Key, Value, false, _) ->
@@ -352,9 +358,9 @@ parse_multi(Data, #mp_parse_state{state=boundary}=ParseState, Acc) ->
         {Pos, Len} ->
             %% If Pos != 0, ignore data preceding the boundary
             case Data of
-                <<_:Pos/binary, Boundary:Len/binary>> ->
+                <<_:Pos/binary, Rest/binary>> when size(Rest) < Len+2 ->
                     %% Not enough data to tell if it is the last boundary or not
-                    {cont, ParseState#mp_parse_state{old_data=Boundary}, Acc};
+                    {cont, ParseState#mp_parse_state{old_data=Rest}, Acc};
                 <<_:Pos/binary, _:Len/binary, "\r\n", Rest/binary>> ->
                     %% It is not the last boundary, so parse the next part
                     NPState = ParseState#mp_parse_state{state=start_headers},
@@ -362,6 +368,9 @@ parse_multi(Data, #mp_parse_state{state=boundary}=ParseState, Acc) ->
                 <<_:Pos/binary, _:Len/binary, "--\r\n", _/binary>> ->
                     %% Match on the last boundary and ignore remaining data
                     {result, Acc};
+                <<_:Pos/binary, Boundary:Len/binary, "--", Rest/binary>> when size(Rest) < 2 ->
+                    %% Partial match on the last boundary; need more data
+		    {cont, ParseState#mp_parse_state{old_data = <<Boundary/binary, "--", Rest/binary>>}, Acc};
                 _ ->
                     {error, malformed_multipart_post}
             end;
@@ -507,7 +516,7 @@ do_parse_spec(<<$=, Tail/binary>>, _Last, Cur, key) ->
     do_parse_spec(Tail, lists:reverse(Cur), [], value); %% change mode
 
 do_parse_spec(<<$%, $u, A:8, B:8,C:8,D:8, Tail/binary>>,
-	       Last, Cur, State) ->
+               Last, Cur, State) ->
     %% non-standard encoding for Unicode characters: %uxxxx,
     Hex = yaws:hex_to_integer([A,B,C,D]),
     do_parse_spec(Tail, Last, [ Hex | Cur],  State);
@@ -773,20 +782,41 @@ find_cookie_val2(Name, [Cookie|Rest]) ->
     end.
 
 %%
-url_decode([$%, Hi, Lo | Tail]) ->
-            Hex = yaws:hex_to_integer([Hi, Lo]),
-            [Hex | url_decode(Tail)];
-            url_decode([$?|T]) ->
-                   %% Don't decode the query string here, that is
-                   %% parsed separately.
-                   [$?|T];
-            url_decode([H|T]) when is_integer(H) ->
-                   [H |url_decode(T)];
-            url_decode([]) ->
-                   [];
-            %% deep lists
-            url_decode([H|T]) when is_list(H) ->
-                   [url_decode(H) | url_decode(T)].
+url_decode(Path) ->
+    {DecPath, QS} = url_decode(Path, []),
+    DecPath1 = case file:native_name_encoding() of
+                   latin1 ->
+                       DecPath;
+                   utf8 ->
+                       case unicode:characters_to_list(list_to_binary(DecPath)) of
+                           UTF8DecPath when is_list(UTF8DecPath) -> UTF8DecPath;
+                           _ -> DecPath
+                       end
+               end,
+    case QS of
+        [] -> lists:flatten(DecPath1);
+        _  -> lists:flatten([DecPath1, $?, QS])
+    end.
+
+url_decode([], Acc) ->
+    {lists:reverse(Acc), []};
+url_decode([$?|Tail], Acc) ->
+    %% Don't decode the query string here, that is parsed separately.
+    {lists:reverse(Acc), Tail};
+url_decode([$%, Hi, Lo | Tail], Acc) ->
+    Hex = yaws:hex_to_integer([Hi, Lo]),
+    url_decode(Tail, [Hex|Acc]);
+url_decode([H|T], Acc) when is_integer(H) ->
+    url_decode(T, [H|Acc]);
+%% deep lists
+url_decode([H|T], Acc) when is_list(H) ->
+    case url_decode(H, Acc) of
+        {P1, []} ->
+            {P2, QS} = url_decode(T, []),
+            {[P1,P2], QS};
+        {P1, QS} ->
+            {P1, QS++T}
+    end.
 
 
 path_norm(Path) ->
@@ -817,7 +847,16 @@ rest_dir (N, Path, [  _H | T ] ) -> rest_dir (N    ,        Path  , T).
 %% url decode the path and return {Path, QueryPart}
 
 url_decode_q_split(Path) ->
-    url_decode_q_split(Path, []).
+    {DecPath, QS} = url_decode_q_split(Path, []),
+    case file:native_name_encoding() of
+        latin1 ->
+            {DecPath, QS};
+        utf8 ->
+            case unicode:characters_to_list(list_to_binary(DecPath)) of
+                UTF8DecPath when is_list(UTF8DecPath) -> {UTF8DecPath, QS};
+                _ -> {DecPath, QS}
+            end
+    end.
 
 url_decode_q_split([$%, Hi, Lo | Tail], Ack) ->
     Hex = yaws:hex_to_integer([Hi, Lo]),
@@ -836,6 +875,8 @@ url_decode_q_split([], Ack) ->
 
 
 
+url_encode([H|T]) when is_list(H) ->
+    [url_encode(H) | url_encode(T)];
 url_encode([H|T]) ->
     if
         H >= $a, $z >= H ->
@@ -931,10 +972,10 @@ stream_chunk_deliver_blocking(YawsPid, Data) ->
             %% not managing to close the socket (FIN_WAIT2
             %% resp. CLOSE_WAIT) the SSL process is not killed (it traps
             %% exit signals) and thus we will leak one file descriptor.
-	    error_logger:error_msg(
-	      "~p:stream_chunk_deliver_blocking/2 STREAM_GARBAGE_TIMEOUT "
-	      "(default 1 hour). Killing ~p", [?MODULE, YawsPid]),
-	    erlang:error(stream_garbage_timeout, [YawsPid, Data])
+            error_logger:error_msg(
+              "~p:stream_chunk_deliver_blocking/2 STREAM_GARBAGE_TIMEOUT "
+              "(default 1 hour). Killing ~p", [?MODULE, YawsPid]),
+            erlang:error(stream_garbage_timeout, [YawsPid, Data])
     end.
 
 stream_chunk_end(YawsPid) ->
@@ -975,7 +1016,10 @@ stream_process_end(Sock, YawsPid) ->
 
 %% Pid must the the process in control of the websocket connection.
 websocket_send(Pid, {Type, Data}) ->
-    yaws_websockets:send(Pid, {Type, Data}).
+    yaws_websockets:send(Pid, {Type, Data});
+websocket_send(Pid, #ws_frame{}=Frame) ->
+    yaws_websockets:send(Pid, Frame).
+
 
 %% returns {ok, SSL socket} if an SSL socket, undefined otherwise
 get_sslsocket({ssl, SslSocket}) ->
@@ -1042,8 +1086,11 @@ set_status_code(Code) ->
 
 %% returns [ Header1, Header2 .....]
 reformat_header(H) ->
-    FormatFun = fun(Hname, Str) ->
-                        lists:flatten(io_lib:format("~s: ~s",[Hname, Str]))
+    FormatFun = fun(Hname, {multi, Values}) ->
+                        [lists:flatten(io_lib:format("~s: ~s", [Hname, Val])) ||
+                            Val <- Values];
+                   (Hname, Str) ->
+                        lists:flatten(io_lib:format("~s: ~s", [Hname, Str]))
                 end,
     reformat_header(H, FormatFun).
 reformat_header(H, FormatFun) ->
@@ -1293,6 +1340,38 @@ set_header(#headers{}=Hdrs, Header, undefined) ->
 set_header(#headers{}=Hdrs, Header, Value) ->
     set_header(Hdrs, {lower, string:to_lower(Header)}, Value).
 
+merge_header(#headers{}=Hdrs, {Header, Value}) ->
+    merge_header(Hdrs, Header, Value).
+
+merge_header(#headers{}=Hdrs, _Header, undefined) ->
+    Hdrs;
+merge_header(#headers{}=Hdrs, Header, Value) when is_atom(Header) ->
+    merge_header(Hdrs, atom_to_list(Header), Value);
+merge_header(#headers{}=Hdrs, Header, Value) when is_binary(Header) ->
+    merge_header(Hdrs, binary_to_list(Header), Value);
+merge_header(#headers{}=Hdrs, Header, Value) when is_binary(Value) ->
+    merge_header(Hdrs, Header, binary_to_list(Value));
+merge_header(Hdrs, {lower, "set-cookie"}=LHdr, Value) ->
+    NewValue = case get_header(Hdrs, LHdr) of
+                   undefined ->
+                       {multi, [Value]};
+                   {multi, MultiVal} ->
+                       {multi, MultiVal ++ [Value]};
+                   ExistingValue ->
+                       {multi, [ExistingValue, Value]}
+               end,
+    set_header(Hdrs, LHdr, NewValue);
+merge_header(Hdrs, {lower, _Header}=LHdr, Value) ->
+    NewValue = case get_header(Hdrs, LHdr) of
+                   undefined ->
+                       Value;
+                   ExistingValue ->
+                       ExistingValue ++ ", " ++ Value
+               end,
+    set_header(Hdrs, LHdr, NewValue);
+merge_header(#headers{}=Hdrs, Header, Value) ->
+    merge_header(Hdrs, {lower, string:to_lower(Header)}, Value).
+
 get_header(#headers{}=Hdrs, connection) ->
     Hdrs#headers.connection;
 get_header(#headers{}=Hdrs, {lower, "connection"}) ->
@@ -1449,17 +1528,13 @@ erlang_header_name("proxy-connection")    -> 'Proxy-Connection';
 erlang_header_name(Name)                  -> capitalize_header(Name).
 
 capitalize_header(Name) ->
-   capitalize_header2(Name, "").
-
-capitalize_header2([C | Rest], "") when C >= $a andalso C =< $z ->
-   capitalize_header2(Rest, [C - $a + $A]);
-capitalize_header2([$-, C | Rest], Result) when C >= $a andalso C =< $z ->
-   capitalize_header2(Rest, [C - $a + $A, $- | Result]);
-capitalize_header2([C | Rest], Result) ->
-   capitalize_header2(Rest, [C | Result]);
-capitalize_header2([], Result) ->
-   lists:reverse(Result).
-
+    %% Before R16B Erlang capitalized words inside header names only for
+    %% headers less than 20 characters long. In R16B that length was raised
+    %% to 50. Using decode_packet lets us be portable.
+    {ok, {http_header, _, Result, _, _}, _} =
+        erlang:decode_packet(httph, list_to_binary([Name, <<": x\r\n\r\n">>]),
+                             []),
+    Result.
 
 reformat_request(#http_request{method = bad_request}) ->
     ["Bad request"];
@@ -2501,18 +2576,17 @@ sanitize_file_name([]) ->
 setconf(GC0, Groups0) ->
     setconf(GC0, Groups0, true).
 setconf(GC0, Groups0, CheckCertsChanged) ->
-    CertsChanged = if CheckCertsChanged == true ->
-                           lists:member(yes,gen_server:call(
-                                              yaws_server,
-                                              check_certs, infinity));
-                      true ->
-                           false
-                   end,
-    if
-        CertsChanged ->
-            application:stop(ssl),
-            application:start(ssl);
+    case CheckCertsChanged of
         true ->
+            CertCheck = gen_server:call(yaws_server, check_certs, infinity),
+            case lists:member(yes, CertCheck) of
+                true ->
+                    application:stop(ssl),
+                    application:start(ssl);
+                false ->
+                    ok
+            end;
+        false ->
             ok
     end,
 
@@ -2529,13 +2603,15 @@ setconf(GC0, Groups0, CheckCertsChanged) ->
             {error, need_restart}
     end.
 
-
-
-
 %% return {ok, GC, Groups}.
 getconf() ->
     gen_server:call(yaws_server, getconf, infinity).
 
+%% return listen port number for the given sconf, useful if yaws is used in
+%% a test scenario where the configured port number is 0 (for requesting an
+%% ephemeral port)
+get_listen_port(SC) ->
+    yaws_server:listen_port(SC).
 
 embedded_start_conf(DocRoot) when is_list(DocRoot) ->
     embedded_start_conf(DocRoot, []).

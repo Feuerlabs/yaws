@@ -1,6 +1,6 @@
 include support/include.mk
 
-SUBDIRS = t1 t2 t3 t4 t5 t6 t7 t8 t9 eunit
+SUBDIRS = t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 eunit
 
 all:	ibrowse
 	@cd src; $(MAKE) all
@@ -30,10 +30,10 @@ test:
           done
 
 ibrowse: fetch_ibrowse
-	@cd ibrowse; $(MAKE)
+	@cd ibrowse; ./rebar compile
 
 IBROWSE_URI = https://github.com/cmullaparthi/ibrowse.git
-IBROWSE_DOWNLOAD_URI = https://github.com/cmullaparthi/ibrowse/tarball/master
+IBROWSE_DOWNLOAD_URI = https://github.com/cmullaparthi/ibrowse/tarball/v3.0.4
 IBROWSE_TGZ = ibrowse.tar.gz
 IBROWSE_VSN = ibrowse/.version
 

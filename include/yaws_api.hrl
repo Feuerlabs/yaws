@@ -11,7 +11,8 @@
           clisock,        % the socket leading to the peer client
           client_ip_port, % {ClientIp, ClientPort} tuple
           headers,        % headers
-          req,            % request
+          req,            % request (possibly rewritten)
+          orig_req,       % original request
           clidata,        % The client data (as a binary in POST requests)
           server_path,    % The normalized server path
                           % (pre-querystring part of URI)
@@ -114,8 +115,8 @@
          }).
 
 %% Corresponds to the frame sections as in
-%% http://tools.ietf.org/html/draft-ietf-hybi-thewebsocketprotocol-08#section-4
-%% plus 'data' and 'ws_state'
+%% http://tools.ietf.org/html/rfc6455#section-5.2
+%% plus 'data' and 'ws_state'. Used for incoming frames.
 -record(ws_frame_info, {
           fin,
           rsv,
@@ -128,6 +129,15 @@
           ws_state     % The ws_state after unframing this frame.
                        % This is useful for the endpoint to know what type of
                        % fragment a potentially fragmented message is.
+         }).
+
+%% Used for outgoing frames. No checks are done on the validity of a frame. This
+%% is the application's responsability to send valid frames.
+-record(ws_frame, {
+          fin = true,
+          rsv = 0,
+          opcode,
+          payload = <<>>
          }).
 
 %%----------------------------------------------------------------------

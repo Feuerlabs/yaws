@@ -12,9 +12,10 @@ options for each virtual host is supplied.
 .SH GLOBAL PART
 
 .TP
-\fBlogdir = Directory\fR
-All Yaws logs will be written to files in this directory. There are several
-different log files written by Yaws:
+\fBlogdir = [+]Directory\fR
+All Yaws logs will be written to files in this directory. If specified with
+\fB+\fR, Yaws will attempt to create the directory if it does not exist. There
+are several different log files written by Yaws:
 
 \fBreport.log\fR - this is a text file that contains all error logger printouts
 from Yaws.
@@ -48,6 +49,15 @@ Note that <Host>.access and <Host>.auth files will be used only if the directive
 This directive adds Directory to the Erlang search path. It is possible to have
 several of these commands in the configuration file. The default value is
 \fI"yaws_dir"/examples/ebin\fR
+
+.TP
+\fBsrc_dir = Directory\fR
+This directive defines a Directory as a \fIsource\fR directory. Yaws will
+compile all erlang modules found in this directory and all its
+subdirectories. The compilation occurs when the configuration is loaded or
+reloaded. The \fBinclude_dir\fR directives are used to search for includes
+files. Multiple \fBsrc_dir\fR directives may be used. There is no such directory
+configured by default.
 
 
 .TP
@@ -139,6 +149,23 @@ of valid process options. The supported options are \fIfullsweep_after\fR,
 \fImin_heap_size\fR, and \fImin_bin_vheap_size\fR, each taking an associated
 integer value. Other process options are ignored. The proplist may also be
 empty. See \fBerlang:spawn_opt/4\fR for details on these options.
+
+.TP
+\fBlarge_file_chunk_size = Integer\fR
+Set the chunk size used by Yaws to send large files when sendfile is not
+supported or disabled. The default value is \fI10240\fR.
+
+.TP
+\fBlarge_file_sendfile = erlang | yaws | disable\fR
+Set the version of sendfile method to use to send large files (if supported):
+
+\fBerlang\fR - use \fIfile:sendfile/5\fR, if supported.
+
+\fByaws\fR - use Yaws sendfile linked-in driver, if supported.
+
+\fBdisable\fR - do not use any sendfile method, but \fIgen_tcp:send/2\fR.
+
+The default value is \fIyaws\fR.
 
 .TP
 \fBacceptor_pool_size = Integer\fR
@@ -324,8 +351,31 @@ specify several addresses to listen on.
 .TP
 \fBlisten_backlog = Integer\fR
 This sets the TCP listen backlog for the server to define the maximum length the
-queue of pending connections may grow to. The default is the same as the default
-provided by \fIgen_tcp:listen/2\fR, which is 5.
+queue of pending connections may grow to. The default is 1024.
+
+.TP
+\fB<listen_opts> ... </listen_opts>\fR
+Defines extra options to be set on the listen socket and, by inheritance, on
+accepted sockets. See \fIinet:setopts/2\fR for details. Supported options are:
+
+\fBbuffer = Integer\fR (default: same as \fIinet:setopts/2\fR)
+
+\fBdelay_send = true  | false \fR (default: same as \fIinet:setopts/2\fR)
+
+\fBlinger = Integer | false \fR (default: same as \fIinet:setopts/2\fR)
+
+\fBnodelay = true | false \fR (default: same as \fIinet:setopts/2\fR)
+
+\fBpriority = Integer\fR (default: same as \fIinet:setopts/2\fR)
+
+\fBsndbuf = Integer\fR (default: same as \fIinet:setopts/2\fR)
+
+\fBrecbuf = Integer\fR (default: 8196)
+
+\fBsend_timeout = Integer | infinity\fR (default: same as \fIinet:setopts/2\fR)
+
+\fBsend_timeout_close = true | false \fR (default: same as \fIinet:setopts/2\fR)
+.RE
 
 .TP
 \fBserver_signature = String\fR
@@ -344,7 +394,7 @@ iptables are used to redirect traffic to port 80 to port 8000 (most NAT:ing
 firewalls will also do this for you).
 
 .TP
-\fBrscheme = http | https\fR
+\fBrmethod = http | https\fR
 This forces all local redirects issued by the server to use this method. This is
 useful when an SSL off-loader, or stunnel, is used in front of Yaws.
 
@@ -820,6 +870,27 @@ doesn't necessarily have to be the same as the the name inside <server Name> in
 certain NAT scenarios. Rarely used feature.
 
 .TP
+\fBserveralias = ListOfNames\fR
+
+This directive sets the alternate names for a virtual host. A server alias may
+contain wildcards:
+.RS 12
+ '*' matches any sequence of zero or more characters
+ '?' matches one character unless that character is a period ('.')
+.RE
+.IP
+Multiple \fBserveralias\fR directives may be used. Here is an example:
+
+.nf
+  <server server.domain.com>
+    serveralias = server server2.domain.com server2
+    serveralias = *.server.domain.com *.server?.domain.com
+    ...
+  </server>
+.fi
+
+
+.TP
 \fBphp_handler = <Type, Spec>\fR
 Set handler to interpret .php files. It can be one of the following definitions:
 
@@ -988,6 +1059,15 @@ ciphers = "[{dhe_rsa,aes_256_cbc,sha}, \\
 .fi
 .RE
 
+.IP
+\fBsecure_renegotiate = true | false\fR
+.RS 12
+Specifies if to reject renegotiation attempt that does not live up to RFC
+5746. By default \fBsecure_renegotiate\fR is set to false i.e. secure
+renegotiation will be used if possible but it will fallback to unsecure
+renegotiation if the peer does not support RFC 5746.
+.RE
+
 .TP
 \fB<redirect> ... </redirect>\fR
 Defines a redirect mapping. The following items are allowed within a matching
@@ -1001,12 +1081,12 @@ We can have a series of redirect rules in one of formats below:
   Path = code URL
 .fi
 
-\fBPath\fR must begin with a slash. \fBURL\fR may be either a relative URL (a
-path beginning with a slash), or an absolute URL. In the first case, the
-\fIscheme:hostname:port\fR of the current server will be added. All accesses to
-\fBPath\fR will be redirected to \fBURL/Path\fR (or
-\fBscheme:hostname:port/URL/Path\fR if \fBURL\fR is relative). Note that the
-original path is appended to the redirected URL.
+\fBPath\fR must be an url-decoded path beginning with a slash. \fBURL\fR may be
+either a relative URL (a path beginning with a slash), or an absolute URL. In
+the first case, the \fIscheme:hostname:port\fR of the current server will be
+added. All accesses to \fBPath\fR will be redirected to \fBURL/Path\fR (or
+\fBscheme:hostname:port/URL/Path\fR if \fBURL\fR is relative). \fBURL\fR must be
+url-encoded. Note that the original path is appended to the redirected URL.
 
 For example, assume we have the following redirect configuration:
 

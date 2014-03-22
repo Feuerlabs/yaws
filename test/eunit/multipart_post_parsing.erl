@@ -108,6 +108,37 @@ incomplete_head_binary_test() ->
     {<<"sometext1\n">>, <<"sometext2\n">>} = test_incomplete_head_list(binary),
     ok.
 
+boundary_markers_test() ->
+    Body = <<"------WebKitFormBoundaryUkx0KS47IKKfcF4z\r\n",
+             "Content-Disposition: form-data; name=upfile; filename=test.txt\r\n",
+             "Content-Type: text/plain\r\n",
+             "\r\n",
+             "Hello world\n",
+             "\r\n",
+             "------WebKitFormBoundaryUkx0KS47IKKfcF4z\r\n",
+             "Content-Disposition: form-data; name=note\r\n",
+             "\r\n",
+             "test\r\n",
+             "------WebKitFormBoundaryUkx0KS47IKKfcF4z--\r\n">>,
+    Results = lists:foldl(fun (N, {Ok, Errors, Done}) ->
+                                  <<BodyPart:N/binary, _/binary>> = Body,
+                                  case boundary_marker_parse(BodyPart) of
+                                      {cont, _, _} ->
+                                          {Ok+1, Errors, Done};
+                                      {result, _} ->
+                                          {Ok+1, Errors, Done+1};
+                                      _ ->
+                                          {Ok, Errors+1, Done}
+                                  end
+                          end, {0, 0, 0}, lists:seq(1, size(Body))),
+    ?assertMatch({_, 0, 1}, Results).
+
+boundary_marker_parse(Body) ->
+    Arg = #arg{headers=#headers{content_type="multipart/form-data; boundary=----WebKitFormBoundaryUkx0KS47IKKfcF4z"},
+               req=#http_request{method='POST'},
+               clidata=Body},
+    yaws_api:parse_multipart_post(Arg).
+
 test_incomplete_boundary_list(Opt) ->
     Data1 = list_to_binary(
               ["--!!!\r\n",
@@ -190,6 +221,35 @@ malformed_multipart_form_test() ->
     {error, no_content_type} = yaws_api:parse_multipart_post(A4),
     A5 = #arg{headers=Hdrs2, req=Req2},
     {error, no_multipart_form_data} = yaws_api:parse_multipart_post(A5),
+    ok.
+
+escaped_data_to_parse(Name) ->
+    list_to_binary(
+      ["--!!!\r\n",
+       "Content-Disposition: form-data; name=\"" ++ Name ++ "\"\r\n\r\n"
+       "sometext\n\r\n--!!!--\r\n"]).
+
+get_unescaped_name(RawName) ->
+    Data = escaped_data_to_parse(RawName),
+    {result, Params} = yaws_api:parse_multipart_post(mk_arg(Data)),
+    2 = length(Params),
+    {Name, HeadParams} = proplists:get_value(head, Params),
+    [{"name", Name}] = HeadParams,
+    Name.
+
+escaped_parse_test() ->
+    %% Support both escaped (Firefox, Opera) and unescaped (Konqueror)
+    %% quotation mark.
+    "a\"b" = get_unescaped_name("a\\\"b"),
+    "a\"b" = get_unescaped_name("a\"b"),
+    %% Do not decode "%22" (IE, Chrome), user must deal with ambiguity
+    %% himself.
+    "a%22b" = get_unescaped_name("a%22b"),
+    %% Support unescaped backslash (Firefox, Chrome, Konqueror, IE).
+    "a\\b" = get_unescaped_name("a\\b"),
+    "a\\\\b" = get_unescaped_name("a\\\\b"),
+    %% Support backslash at the end of name (for simple form values).
+    "a\\" = get_unescaped_name("a\\"),
     ok.
 
 mk_arg(Data) ->

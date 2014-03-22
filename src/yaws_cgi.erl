@@ -23,9 +23,9 @@
 
 -export([cgi_worker/7, fcgi_worker/5]).
 
-%%%==============================================================================
+%%%=====================================================================
 %%% Code shared between CGI and FastCGI
-%%%==============================================================================
+%%%=====================================================================
 
 -define(ASCII_NEW_LINE, 10).
 -define(ASCII_CARRIAGE_RETURN, 13).
@@ -98,7 +98,8 @@ get_from_worker(Arg, WorkerPid) ->
                    end,
             case Next of
                 normal ->
-                    {ContentResps, NotCtnt} = filter2(fun iscontent/1, AllResps),
+                    {ContentResps, NotCtnt} =
+                        filter2(fun iscontent/1, AllResps),
                     {RedirResps, Others} = filter2(fun isredirect/1, NotCtnt),
                     case RedirResps of
                         [R|_] ->
@@ -185,13 +186,16 @@ get_socket_sockname(Socket) ->
 
 
 build_env(Arg, Scriptfilename, Pathinfo, ExtraEnv, SC) ->
-    H = Arg#arg.headers,
-    R = Arg#arg.req,
-    case R#http_request.path of
+    H       = Arg#arg.headers,
+    Req     = Arg#arg.req,
+    OrigReq = Arg#arg.orig_req,
+
+    %% Use the original request to set REQUEST_URI
+    case OrigReq#http_request.path of
         {abs_path, RequestURI} -> ok;
         _ -> RequestURI = undefined
     end,
-    {Maj,Min} = R#http_request.version,
+    {Maj,Min} = Req#http_request.version,
     {Hostname, Hosttail}=lists:splitwith(fun(X)->X /= $: end,
                                          checkdef(H#headers.host)),
     Hostport = case Hosttail of
@@ -259,12 +263,12 @@ build_env(Arg, Scriptfilename, Pathinfo, ExtraEnv, SC) ->
     end,
 
     Extra_CGI_Vars = lists:flatmap(fun({Dir, Vars}) ->
-					   case lists:prefix(Dir, Scriptname) of
-					       true -> Vars;
-					       false -> []
-					   end
-				   end,
-				   SC#sconf.extra_cgi_vars),
+                                           case lists:prefix(Dir, Scriptname) of
+                                               true -> Vars;
+                                               false -> []
+                                           end
+                                   end,
+                                   SC#sconf.extra_cgi_vars),
 
     %% Some versions of erlang:open_port can't handle query strings that
     %% end with an equal sign. This is because the broken versions treat
@@ -311,7 +315,7 @@ build_env(Arg, Scriptfilename, Pathinfo, ExtraEnv, SC) ->
             {"SERVER_PROTOCOL", "HTTP/" ++ integer_to_list(Maj) ++
              "." ++ integer_to_list(Min)},
             {"SERVER_PORT", Hostport},
-            {"REQUEST_METHOD", yaws:to_list(R#http_request.method)},
+            {"REQUEST_METHOD", yaws:to_list(Req#http_request.method)},
             {"REQUEST_URI", RequestURI},
             {"DOCUMENT_ROOT",         Arg#arg.docroot},
             {"DOCUMENT_ROOT_MOUNT", Arg#arg.docroot_mount},
@@ -367,7 +371,7 @@ build_env(Arg, Scriptfilename, Pathinfo, ExtraEnv, SC) ->
            ]++lists:map(fun({http_header,_,Var,_,Val})->{tohttp(Var),Val} end,
                         H#headers.other)
           )) ++
-	Extra_CGI_Vars.
+        Extra_CGI_Vars.
 
 tohttp(X) ->
     "HTTP_"++lists:map(fun tohttp_c/1, yaws:to_list(X)).
@@ -467,9 +471,9 @@ get_opt(Key, List, Default) ->
     end.
 
 
-%%%==============================================================================
+%%%==========================================================================
 %%% Code specific to CGI
-%%%==============================================================================
+%%%==========================================================================
 
 %%%  TO DO:  Handle failure and timeouts.
 
@@ -652,9 +656,9 @@ cgi_add_resp(Bin, Port) ->
     end.
 
 
-%%%==============================================================================
+%%%===========================================================================
 %%% Code specific to FastCGI
-%%%==============================================================================
+%%%===========================================================================
 
 -define(FCGI_VERSION_1, 1).
 
@@ -1086,7 +1090,8 @@ fcgi_encode_name_value(Name, Value) when is_list(Name) and is_list(Value) ->
                         true ->
                             <<(ValueSize bor 16#80000000):32>>
                     end,
-    list_to_binary([<<NameSizeData/binary, ValueSizeData/binary>>, Name, Value]).
+    list_to_binary([<<NameSizeData/binary,
+                      ValueSizeData/binary>>, Name, Value]).
 
 
 fcgi_header_loop(WorkerState) ->

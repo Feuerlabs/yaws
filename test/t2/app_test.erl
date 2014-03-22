@@ -36,8 +36,12 @@ start() ->
     test_throw(),
     test_too_many_headers(),
     test_index_files(),
-    test_websocket(),
     test_embedded_id_dir(),
+    test_embedded_listen_ip(),
+    test_chained_appmods(),
+    test_cache_appmod(),
+    test_multi_forwarded_for(),
+    test_log_rotation(),
     ibrowse:stop().
 
 
@@ -772,7 +776,7 @@ arg_rewrite_test_rewrite() ->
     io:format("  rewrite\n", []),
     Uri = "http://localhost:8006/rewrite",
     ?line {ok, "200", Hdrs, _} = ibrowse:send_req(Uri, [], get),
-    ?line "text/plain" = proplists:get_value("Content-Type", Hdrs),
+    ?line "text/plain" = split_content_type(Hdrs),
     {ok, FI} = file:read_file_info("./www/hello.txt"),
     Etag = yaws:make_etag(FI),
     ?line Etag = proplists:get_value("Etag", Hdrs),
@@ -790,11 +794,13 @@ arg_rewrite_test_response() ->
     io:format("  response\n", []),
     Uri = "http://localhost:8006/response",
     ?line {ok, "200", Hdrs, Content} = ibrowse:send_req(Uri, [], get),
-    ?line "text/plain" = proplists:get_value("Content-Type", Hdrs),
+    ?line "text/plain" = split_content_type(Hdrs),
     ?line "Goodbye, Cruel World!" = Content,
     ok.
 
-
+%% split content type away from any charset info
+split_content_type(Hdrs) ->
+    hd(string:tokens(proplists:get_value("Content-Type", Hdrs), " ;")).
 
 test_shaper() ->
     io:format("shaper_test\n", []),
@@ -808,21 +814,27 @@ test_shaper() ->
 
 
 test_sslaccept_timeout() ->
-    io:format("sslaccept_tout_test\n", []),
-    {ok, Sock} = gen_tcp:connect("localhost", 8443, [binary, {active, true}]),
-    ?line ok = receive
-                   {tcp_closed, Sock} -> ok
-               after
-                   %% keepalive_timeout is set to 10 secs. So, wait 15 secs
-                   %% before returning an error
-                   15000 -> error
-               end,
-    gen_tcp:close(Sock),
+    case erlang:system_info(version) of
+        "5.9.3" ->
+            io:format("sslaccept_tout_test (skipping due to R15B03 bug)\n", []);
+        _ ->
+            io:format("sslaccept_tout_test\n", []),
+            {ok, Sock} = gen_tcp:connect("localhost", 8443, [binary, {active, true}]),
+            ?line ok = receive
+                           {tcp_closed, Sock} -> ok
+                       after
+                           %% keepalive_timeout is set to 10 secs. So, wait 15 secs
+                           %% before returning an error
+                           15000 -> error
+                       end,
+            gen_tcp:close(Sock)
+    end,
     ok.
 
 test_ssl_multipart_post() ->
     io:format("ssl_multipart_post_test\n", []),
     ok = application:start(crypto),
+    ok = application:start(asn1),
     ok = application:start(public_key),
     ok = application:start(ssl),
     Boundary = "----------------------------3e9876546ecf\r\n",
@@ -838,6 +850,7 @@ test_ssl_multipart_post() ->
     ?line {ok, "200", _, _} = ibrowse:send_req(Uri, Headers, post, Data, Options),
     ok = application:stop(ssl),
     ok = application:stop(public_key),
+    ok = application:stop(asn1),
     ok = application:stop(crypto),
     ok.
 
@@ -883,45 +896,9 @@ test_index_files() ->
     ?line {ok, "200", _, Content} = ibrowse:send_req(Uri5, [], get),
     ok.
 
-%% Do handshake, then send "hello" in a text frame
-%% and check that "hello" is echoed back.
-test_websocket() ->
-    OpenHeads = "GET /websockets_example_endpoint.yaws HTTP/1.1\r\n"
-        "Host: localhost\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-        "Origin: http://localhost\r\n"
-        "Sec-WebSocket-Version: 13\r\n\r\n",
-    Opts = [{send_timeout, 2000},
-            binary,
-            {packet, 0},
-            {active, false}],
-    {ok, Sock} = gen_tcp:connect(localhost, 8000, Opts),
-    ok = gen_tcp:send(Sock, OpenHeads),
-    {ok, Packet} = gen_tcp:recv(Sock, 0, 2000),
-    AcceptLines = re:split(Packet, "[\r\n]+", [{return, list}, trim]),
-    %% Check that exactly the expected lines are there, in any order
-    4 = length(AcceptLines),
-    true = lists:member("HTTP/1.1 101 Switching Protocols", AcceptLines),
-    true = lists:member("Upgrade: websocket", AcceptLines),
-    true = lists:member("Connection: Upgrade", AcceptLines),
-    true = lists:member("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
-                        AcceptLines),
-
-    %% Text frame "hello" with mask "aaaa"
-    Frame =
-        <<129, 133, "aaaa", 38722669838:5/integer-unit:8>>,
-    ok = gen_tcp:send(Sock, Frame),
-    ExpectFrame = <<129, 5, "hello">>,
-    {ok, ExpectFrame} = gen_tcp:recv(Sock, 0, 2000),
-
-    %% Text frame "hello" without masking
-    UnmaskedFrame = <<129, 5, "hello">>,
-    ok = gen_tcp:send(Sock, UnmaskedFrame),
-    {ok, ExpectFrame} = gen_tcp:recv(Sock, 0, 2000).
 
 test_embedded_id_dir() ->
+    io:format("test_embedded_id_dir\n", []),
     Id = "id_dir_test",
     GconfList = [{id, Id},
                  {logdir, "./logs"},
@@ -941,6 +918,101 @@ test_embedded_id_dir() ->
     after
         ok = file:del_dir(yaws:id_dir(Id))
     end.
+
+test_embedded_listen_ip() ->
+    %% make sure we can specify a listen address as either
+    %% a list or a tuple
+    lists:map(fun(IP) ->
+		      DocRoot = ".",
+		      Id = "embedded_listen",
+		      SConf = [{servername, "embedded_listen:8000"},
+			       {docroot, DocRoot},
+			       {listen, IP},
+			       {port, 0},
+			       {appmods,[{"/", ?MODULE}]}],
+		      GConf = [{id, Id}],
+		      ok = yaws:start_embedded(DocRoot, SConf, GConf, Id),
+		      yaws:stop()
+	      end, [{0,0,0,0}, "0.0.0.0"]).
+
+test_chained_appmods() ->
+    io:format("test_chained_appmods\n", []),
+    {ok, Bin} = file:read_file("../../www/1000.txt"),
+    Content = binary_to_list(Bin),
+    Uri = "http://localhost:8012/",
+    ?line {ok, "200", Hdrs, Content} = ibrowse:send_req(Uri, [], get),
+    ?line "appmod1[/], appmod2[/appmod2], appmod1[/appmod1], appmod3[/1000.txt]" =
+        proplists:get_value("X-AppMods", Hdrs),
+    ok.
+
+test_cache_appmod() ->
+    io:format("test_cache_appmod\n", []),
+    Uri1 = "http://localhost:8013/index.yaws?no-cache=1",
+    Uri2 = "http://localhost:8013/index.yaws",
+
+    %% call cache_appmod_test and disable page cache
+    ?line {ok, "200", Hdrs1, _} = ibrowse:send_req(Uri1, [], get),
+    ?line "cache_appmod_test" = proplists:get_value("X-Appmod", Hdrs1),
+
+    %% check that index.yaws is not cached
+    ?line {ok, "200", Hdrs2, _} = ibrowse:send_req(Uri2, [], get),
+    ?line "cache_appmod_test" = proplists:get_value("X-Appmod", Hdrs2),
+
+    %% retrieve index.yaws from the cache, so cache_appmod_test is not called
+    ?line {ok, "200", Hdrs3, _} = ibrowse:send_req(Uri2, [], get),
+    ?line undefined = proplists:get_value("X-Appmod", Hdrs3),
+
+    ok.
+
+test_multi_forwarded_for() ->
+    io:format("test_multi_forwarded_for\n", []),
+    %% apparently ibrowse can't handle sending two separate headers with
+    %% the same name but different values, which is needed for this test
+    ?line {ok, S} = gen_tcp:connect(localhost, 8014, [{active,false},
+                                                      {packet,http}]),
+    ok = gen_tcp:send(S, ["GET / HTTP/1.1\r\nHost: localhost\r\n"
+                          "X-Forwarded-For: 192.168.1.1\r\n",
+                          "X-Forwarded-For: 192.168.1.2\r\n\r\n"]),
+    ?line ok = check_forwarded_for(S),
+    ok.
+
+check_forwarded_for(S) ->
+    inet:setopts(S, [{active,once}]),
+    receive
+        {http, S, {http_response, _, Code, _}} ->
+            gen_tcp:close(S),
+            case Code of
+                200 ->
+                    ok;
+                _ ->
+                    Code
+            end
+    end.
+
+test_log_rotation() ->
+    io:format("test_log_rotation\n", []),
+    %% Write 1M of data in .access and .auth log to check the log rotation
+    ?line {ok, Fd1} = file:open("./logs/localhost:8000.access", [write]),
+    ?line ok = file:write(Fd1, lists:duplicate(1000001, $a)),
+    file:close(Fd1),
+    file:sync(Fd1),
+
+    ?line {ok, Fd2} = file:open("./logs/localhost:8000.auth", [write]),
+    ?line ok = file:write(Fd2, lists:duplicate(1000001, $a)),
+    file:close(Fd2),
+    file:sync(Fd2),
+
+    ?line {ok, "200", _, _} =
+        ibrowse:send_req("http://localhost:8000/wrap_log", [], get),
+
+    timer:sleep(500),
+
+    ?line {ok, _} = file:read_file_info("./logs/localhost:8000.access.old"),
+    ?line {ok, _} = file:read_file_info("./logs/localhost:8000.auth.old"),
+    ?line {ok, _} = file:read_file_info("./logs/localhost:8000.access"),
+    ?line {ok, _} = file:read_file_info("./logs/localhost:8000.auth"),
+
+    ok.
 
 %% used for appmod tests
 %%

@@ -16,11 +16,11 @@ config.status
 ebin/yaws.app
 include.mk
 priv/epam
-priv/charset.def
 scripts/yaws.conf
 src/mime_types.erl
 src/yaws_configure.hrl
 src/yaws_generated.erl
+src/yaws_charset.hrl
 test/ibrowse
 test/ibrowse.tar.gz
 test/support/include.mk
@@ -28,7 +28,12 @@ test/support/include.sh
 test/t1/localhost:8000/
 test/t[1-9]/logs/
 test/t[1-9]/yaws.conf
+test/t1[0-1]/logs/
+test/t1[0-1]/yaws.conf
+test/t2/embedded_listen:8000.auth
 test/t4/www2/8388608.bin
+test/t11/src/srcdir_test.hrl
+test/eunit/localhost:8000.auth
 www/yaws.pdf
 www/yaws.ps
 www/*.txt

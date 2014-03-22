@@ -100,6 +100,7 @@ Nicolas Thauvin
 Fredrik Thulin
 Torbjörn Törnqvist
 Tjeerd van der Laan
+Pablo Vieytes
 Steve Vinoski
 Lev Walkin
 wde
@@ -116,3 +117,4 @@ Nicolas Adiba
 Kalle Zetterlund
 Tjeerd van der Laan
 Kaloyan Dimitrov
+Karolis Petrauskas 

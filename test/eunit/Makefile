@@ -5,7 +5,11 @@ OBJ :=	multipart_post_parsing.beam \
 	ehtml_test.beam \
 	cookies.beam \
 	headers.beam \
-	ipmask.beam
+	ipmask.beam \
+	gconf.beam \
+	sconf.beam \
+	yaws_rpc_test.beam \
+	proc_cleanup.beam
 
 all:	$(OBJ)
 

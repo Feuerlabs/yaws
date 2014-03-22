@@ -1,3 +1,39 @@
+Mon Nov  4 19:22:42 CET 2013 Yaws 1.98
+Bad HTTP 3.0 message sent to yaws, crashed the server entirely. Note this is crucial for yaws servers deployed on internet. (klacke)
+Use Yaws linked-in driver by default to send large file (capflam)
+Rebar work (Steve, Joseph Wayne Norton)
+Wed Oct 16 05:40:25 CEST 2013 Yaws 1.97
+Webdav work, all webdav is now an appmod (tjeerd)
+New serveralias directive.  Now it is possible to set alternate names for a virtual host. A server alias  may contain wildcards. Inside a server definition wecan now have e.g serveralias = *.server.domain.com *.server?.domain.com (capflam)
+pam bug found by Jari Hellman
+optimized ssi code by storing binaries as the data chunks instead of lists of chars (klacke)
+Support message body in DELETE requests  (capflam)
+Group automatically the server configurations in embedded mode. Now, Yaws groups the server configurations by itself when it is started    in embedded mode. This is done when yaws_api:setconf/2 is called. (capflam)
+Use crypto:hash instead of crypto:sha to be compatible with R16B1. (Karolis Petrauskas )
+Use proper linker command for drivers on OpenBSD (Francis Joanis )
+Try to make the log directory if it doesn't exist. This happens only if logdir has a plus sign in front of it. E.g         logdir = +path/to/log. (capflam, James Lee)
+Incorrect X-Forwarded-For header (Manuel Durán Aguete)
+Redhat /etc script bug fix by flavio-fernans
+Install procedure for FreeBSD wasn't correct (klacke)
+More rebar support (Steve, Tuncer)
+Fix option to enable/disable sendfile support in the configure script. file:sendfile/5 implementation is buggy (in R15 & R16). When async-threads are enabled, in efile driver, the tcp socket is set in blocking mode and thesendfile syscall is executed on an async-thread. So an unresponsive client could block it for a very long time and therefore block the async-thread. In this way, all async-threads could be easily blocked. So, by default, the use of sendfile is disable.  (capflam)
+Add support of many options for tcp/ssl sockets (capflam)
+Fix mime_types.erl generation for a local installation of Yaws,  (capflam)
+
+
+Tue Mar 19 17:53:00 CET 2013 Yaws 1.96
+Websocket release, lots of work and rewrites of the websocket code which is now topnotch.
+Handle relative paths when Yaws is started in embedded mode  (capflam)
+ensure compatibility with Erlang R13B04 (steve)
+Handle case with DOS attack towards pam login with embedded NUL chars in username or password. The protocol cannot handle NUL chars and Yaws dies (klacke)
+Extend syntax of redirect block to allow an optional status code. (capflam)
+Support multipart/form-data "name" with backslash at the end. (Johannes Weißl)
+Make be possible to chain appmods (capflam)
+Flush remaining data in case of 3xx redirect (capflam)
+Add support of the 'Vary' header in response (capflam)
+Add access functions for #gconf{} and #sconf{} records (capflam)
+Refactor WebSockets and add support of optional callback functions (capflam)
+
 Wed Oct 17 19:57:05 CEST 2012 Yaws 1.95
 Feature relase, 
 The --heart option didn't work as expected when yaws ran out of filedescriptors - capflam

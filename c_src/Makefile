@@ -12,15 +12,11 @@ else
 	PRIV_FILES= ../priv/lib/setuid_drv.$(DLL)  $(EPAM)
 endif
 
-ifeq ($(HAVE_YAWS_SENDFILE),true)
+ifeq ($(HAVE_SENDFILE),true)
 	PRIV_FILES += ../priv/lib/yaws_sendfile_drv.$(DLL)
 endif
 
-
 CFLAGS += -I"${ERLDIR}/usr/include"
-
-# and for MacOs + possibly others ...
-CFLAGS += -I/usr/include/pam/ $(EXTRAINCLUDE)
 
 #
 # Targets
