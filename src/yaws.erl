@@ -2219,10 +2219,13 @@ parse_auth(Orig = "Basic " ++ Auth64) ->
         {error, _Err} ->
             {undefined, undefined, Orig};
         Auth ->
-            case string:tokens(Auth, ":") of
-                [User, Pass] -> {User, Pass, Orig};
-                _            -> {undefined, undefined, Orig}
-            end
+	    case string:chr(Auth, $:) of
+		0 -> 
+		    {undefined, undefined, Orig};
+		FirstColonPos ->
+		    {User, [$: | Pass]} = lists:split(FirstColonPos - 1, Auth),
+		    {User, Pass, Orig}
+             end
     end;
 parse_auth(Orig = "Negotiate " ++ _Auth64) ->
     {undefined, undefined, Orig};
