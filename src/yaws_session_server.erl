@@ -24,7 +24,7 @@
 -export([new_session/1,new_session/2,new_session/3,new_session/4,
          cookieval_to_opaque/1,
          print_sessions/0,
-         replace_session/2,
+         replace_session/2, replace_session/3,
          delete_session/1]).
 
 %% Default ETS backend callbacks
@@ -77,8 +77,8 @@ get_yaws_session_server_backend() ->
                 {ok, true} ->
                     case application:get_env(yaws, embedded_conf) of
                         {ok, L} when is_list(L) ->
-                            case lists:keysearch(gc, 1, L) of
-                                {value, {_, #gconf{ysession_mod = Backend}}} ->
+                            case lists:keyfind(gc, 1, L) of
+                                {_, #gconf{ysession_mod = Backend}} ->
                                     Backend;
                                 _ ->
                                     DefaultBackend
@@ -116,7 +116,11 @@ print_sessions() ->
     gen_server:cast(?MODULE, print_sessions).
 
 replace_session(Cookie, NewOpaque) ->
-    gen_server:call(?MODULE, {replace_session, Cookie, NewOpaque}, infinity).
+    gen_server:call(?MODULE, {replace_session, Cookie, NewOpaque, undefined},
+                    infinity).
+replace_session(Cookie, NewOpaque, Cleanup) ->
+    gen_server:call(?MODULE, {replace_session, Cookie, NewOpaque, Cleanup},
+                    infinity).
 
 delete_session(CookieVal) ->
     gen_server:call(?MODULE, {delete_session, CookieVal}, infinity).
@@ -151,7 +155,7 @@ handle_call({new_session, Opaque, undefined, Cleanup, Cookie}, From, State) ->
     handle_call({new_session, Opaque, ?TTL, Cleanup, Cookie}, From, State);
 
 handle_call({new_session, Opaque, TTL, Cleanup, undefined}, From, State) ->
-    N = bin2int(crypto:rand_bytes(16)),
+    N = bin2int(yaws_dynopts:rand_bytes(16)),
     Cookie = atom_to_list(node()) ++ [$-|integer_to_list(N)],
     handle_call({new_session, Opaque, TTL, Cleanup, Cookie}, From, State);
 
@@ -182,12 +186,20 @@ handle_call({cookieval_to_opaque, Cookie}, _From, State) ->
     {reply, Result, State, to()};
 
 handle_call({replace_session, Cookie, NewOpaque}, _From, State) ->
+    handle_call({replace_session, Cookie, NewOpaque, undefined}, _From, State);
+handle_call({replace_session, Cookie, NewOpaque, Cleanup}, _From, State) ->
     Backend = State#state.backend,
     Result =
         case Backend:lookup(Cookie) of
             [Y] ->
                 Y2 = Y#ysession{to = gnow() + Y#ysession.ttl,
-                                opaque = NewOpaque},
+                                opaque = NewOpaque,
+                                cleanup = case Cleanup of
+                                              undefined ->
+                                                  Y#ysession.cleanup;
+                                              _ ->
+                                                  Cleanup
+                                          end},
                 Backend:insert(Y2);
             [] ->
                 error
@@ -277,11 +289,58 @@ start_long_timer() ->
     erlang:send_after(long_to(), self(), long_timeout).
 
 long_to() ->
-    60 * 60 * 1000.
+    Default = 60 * 60 * 1000,
+    try yaws_server:getconf() of
+        {ok, #gconf{ysession_long_timeout = LongTO}, _} ->
+            LongTO;
+        _ ->
+            case application:get_env(yaws, embedded) of
+                {ok, true} ->
+                    case application:get_env(yaws, embedded_conf) of
+                        {ok, L} when is_list(L) ->
+                            case lists:keyfind(gc, 1, L) of
+                                {_, #gconf{ysession_long_timeout = LongTO}} ->
+                                    LongTO;
+                                _ ->
+                                    Default
+                            end;
+                        _ ->
+                            Default
+                    end;
+                _ ->
+                    Default
+            end
+    catch
+        _:_ ->
+            %% server not running yet; timeout quickly so we can try again
+            10 * 1000
+    end.
 
 %% timeout if the server is idle for more than 2 minutes.
 to() ->
-    2 * 60 * 1000.
+    Default = 2 * 60 * 1000,
+    case catch yaws_server:getconf() of
+        {ok, #gconf{ysession_idle_timeout = IdleTO}, _} ->
+            IdleTO;
+        _ ->
+            case application:get_env(yaws, embedded) of
+                {ok, true} ->
+                    case application:get_env(yaws, embedded_conf) of
+                        {ok, L} when is_list(L) ->
+                            case lists:keyfind(gc, 1, L) of
+                                {_, #gconf{ysession_idle_timeout = IdleTO}} ->
+                                    IdleTO;
+                                _ ->
+                                    Default
+                            end;
+                        _ ->
+                            Default
+                    end;
+                _ ->
+                    Default
+            end
+    end.
+
 gnow() ->
     calendar:datetime_to_gregorian_seconds(
       calendar:local_time()).

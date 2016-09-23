@@ -8,7 +8,7 @@ PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
 <head>
  <meta name="keywords" content="Yaws"/>
  <title>Yaws</title>
- <meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1"/>
+ <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
  <link rel="stylesheet" type="text/css" href="stil.css"/>
  <link rel="shortcut icon" href="/icons/yaws_y.gif" type="image/x-icon"/>
 </head>
@@ -50,6 +50,7 @@ PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
 <div class="%%haxe_intro%%"> <a href="/haxe_intro.yaws">haXe Remoting</a></div>
 <div class="%%pcookie%%"> <a href="/pcookie.yaws">Persistent Cookies</a> </div>
 <div class="%%query%%"> <a href="/query.yaws">Query Part of URL</a></div>
+<div class="%%rebar%%"> <a href="/rebar_release.yaws">Rebar Releases</a></div>
 <div class="%%redirect%%"> <a href="/redirect.yaws">Redirect</a> </div>
 <div class="%%sse%%"> <a href="/server_sent_events.yaws">Server-Sent Events</a> </div>
 <div class="%%ssi%%"> <a href="/ssi.yaws">Server Side Includes</a> </div>

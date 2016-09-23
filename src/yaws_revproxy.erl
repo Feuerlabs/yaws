@@ -95,16 +95,13 @@ out(#arg{state=#revproxy{}=RPState}=Arg)
     HdrsStr = yaws:headers_to_str(NewHdrs),
     case send(RPState, [ReqStr, "\r\n", HdrsStr, "\r\n"]) of
         ok ->
-            TE = yaws:to_lower(Hdrs#headers.transfer_encoding),
-            RPState1 = if
-                           (Hdrs#headers.content_length == undefined andalso
-                            TE == "chunked") ->
-                               ?Debug("Request content is chunked~n", []),
-                               RPState#revproxy{state=sendchunk};
-                           true ->
-                               RPState#revproxy{state=sendcontent}
-                       end,
-            out(Arg#arg{state=RPState1});
+            case yaws:to_lower(Hdrs#headers.transfer_encoding) of
+                "chunked" ->
+                    ?Debug("Request content is chunked~n", []),
+                    out(Arg#arg{state=RPState#revproxy{state=sendchunk}});
+                _ ->
+                    out(Arg#arg{state=RPState#revproxy{state=sendcontent}})
+            end;
 
         {error, Reason} ->
             ?Debug("TCP error: ~p~n", [Reason]),
@@ -253,21 +250,15 @@ out(#arg{state=RPState}=Arg) when RPState#revproxy.state == recvheaders ->
 
                 true ->
                     RPState2 =
-                        case RespHdrs#headers.content_length of
-                            undefined ->
-                                TE = yaws:to_lower(
-                                       RespHdrs#headers.transfer_encoding),
-                                case TE of
-                                    "chunked" ->
-                                        ?Debug("Response content is chunked~n",
-                                               []),
-                                        RPState1#revproxy{state=recvchunk};
-                                    _ ->
-                                        RPState1#revproxy{
-                                          cliconn_status="close",
-                                          srvconn_status="close",
-                                          state=recvcontent}
-                                end;
+                        case {yaws:to_lower(RespHdrs#headers.transfer_encoding),
+                              RespHdrs#headers.content_length} of
+                            {"chunked", _} ->
+                                RPState1#revproxy{state=recvchunk};
+                            {_, undefined} ->
+                                RPState1#revproxy{
+                                  cliconn_status="close",
+                                  srvconn_status="close",
+                                  state=recvcontent};
                             _ ->
                                 RPState1#revproxy{state=recvcontent}
                         end,
@@ -574,24 +565,19 @@ connect(URL) ->
     end.
 
 do_connect(URL) ->
-    InetType = if
-                   is_tuple(URL#url.host), size(URL#url.host) == 8 -> [inet6];
-                   true -> []
-               end,
     Opts = [
             binary,
             {packet,    raw},
             {active,    false},
-            {recbuf,    8192},
             {reuseaddr, true}
-           ] ++ InetType,
+           ],
     case URL#url.scheme of
         http  ->
             Port = case URL#url.port of
                        undefined -> 80;
                        P         -> P
                    end,
-            case gen_tcp:connect(URL#url.host, Port, Opts) of
+            case yaws:tcp_connect(URL#url.host, Port, Opts) of
                 {ok, S} -> {ok, S, nossl};
                 Err     -> Err
             end;
@@ -600,7 +586,7 @@ do_connect(URL) ->
                        undefined -> 443;
                        P         -> P
                    end,
-            case ssl:connect(URL#url.host, Port, Opts) of
+            case yaws:ssl_connect(URL#url.host, Port, Opts) of
                 {ok, S} -> {ok, S, ssl};
                 Err     -> Err
             end;

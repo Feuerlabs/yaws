@@ -13,7 +13,6 @@
 
 -include("../include/yaws.hrl").
 -include("../include/yaws_api.hrl").
--include("yaws_configure.hrl").
 
 -include_lib("kernel/include/file.hrl").
 
@@ -47,7 +46,7 @@
                  msg_fun_2,
                  info_fun}).
 
--export([start/3, send/2]).
+-export([start/3, send/2, close/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -133,6 +132,10 @@ send(Pid, {Type, Data}) ->
 send(Pid, #ws_frame{}=Frame) ->
     gen_server:cast(Pid, {send, Frame}).
 
+close(#ws_state{}=WSState, Reason) ->
+    do_close(WSState, Reason);
+close(Pid, Reason) ->
+    gen_server:cast(Pid, {close, Reason}).
 
 %%%----------------------------------------------------------------------
 %% gen_server functions
@@ -251,6 +254,9 @@ handle_cast({send, {Type, Data}}, #state{wsstate=WSState}=State) ->
 handle_cast({send, #ws_frame{}=Frame}, #state{wsstate=WSState}=State) ->
     do_send(WSState, Frame),
     {noreply, State, State#state.timeout};
+handle_cast({close, Reason}, #state{wsstate=WSState}=State) ->
+    do_close(WSState, Reason),
+    {noreply, State, State#state.timeout};
 
 %% Skip all other async messages
 handle_cast(_Msg, State) ->
@@ -295,14 +301,12 @@ handle_info(timeout, #state{close_timer=TRef}=State) when TRef /= undefined ->
 
 %% Keepalive timeout: send a ping frame and wait for any reply
 handle_info(timeout, #state{wait_pong_frame=false}=State) ->
-    error_logger:info_msg("Send ping frame", []),
     GracePeriod = get_opts(keepalive_grace_period, State#state.opts),
     do_send(State#state.wsstate, {ping, <<>>}),
     {noreply, State#state{wait_pong_frame=true}, GracePeriod};
 
 %% Grace period timeout
 handle_info(timeout, #state{wait_pong_frame=true}=State) ->
-    error_logger:error_msg("endpoint gone away !", []),
     State1 = State#state{wait_pong_frame=false},
     case get_opts(drop_on_timeout, State1#state.opts) of
         true  -> handle_abnormal_closure(State1);
@@ -1247,13 +1251,7 @@ query_header(HeaderName, Headers) ->
 query_header(Header, Headers, Default) ->
     yaws_api:get_header(Headers, Header, Default).
 
--ifdef(HAVE_CRYPTO_HASH).
--define(CRYPTO_HASH(V), crypto:hash(sha,V)).
--else.
--define(CRYPTO_HASH(V), crypto:sha(V)).
--endif.
-
 hash_nonce(Nonce) ->
     Salted = Nonce ++ "258EAFA5-E914-47DA-95CA-C5AB0DC85B11",
-    HashBin = ?CRYPTO_HASH(Salted),
+    HashBin = crypto:hash(sha, Salted),
     base64:encode_to_string(HashBin).

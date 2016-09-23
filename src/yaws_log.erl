@@ -305,7 +305,7 @@ handle_cast({_ServerName, access, Fd, {Ip, Req, InH, OutH, _}}, State) ->
                       _     -> "HTTP/X.X"
                   end,
 
-            Path      = yaws_server:safe_decode_path(Req#http_request.path),
+            Path      = yaws_server:safe_path(Req#http_request.path),
             Meth      = yaws:to_list(Req#http_request.method),
             Referer   = optional_header(InH#headers.referer),
             UserAgent = optional_header(InH#headers.user_agent),
@@ -461,7 +461,7 @@ fmt_ip(HostName, _) ->
 
 fmtnow() ->
     {{Year, Month, Day}, {Hour, Min, Sec}} =
-        calendar:now_to_local_time(now()),
+        calendar:now_to_local_time(yaws:get_time_tuple()),
     ["[",fill_zero(Day,2),"/",yaws:month(Month),"/",integer_to_list(Year),":",
      fill_zero(Hour,2),":",fill_zero(Min,2),":",
      fill_zero(Sec,2)," ",zone(),"]"].

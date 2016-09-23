@@ -29,7 +29,7 @@
          set_content_type/1,
          htmlize/1, htmlize_char/1, f/2, fl/1]).
 -export([find_cookie_val/2, secs/0,
-         url_decode/1, url_decode_q_split/1,
+         url_decode/1, url_decode_q_split/1, url_decode_with_encoding/2,
          url_encode/1, parse_url/1, parse_url/2, format_url/1,
          format_partial_url/2]).
 -export([is_absolute_URI/1]).
@@ -40,12 +40,13 @@
          stream_chunk_end/1]).
 -export([stream_process_deliver/2, stream_process_deliver_chunk/2,
          stream_process_deliver_final_chunk/2, stream_process_end/2]).
--export([websocket_send/2]).
+-export([websocket_send/2, websocket_close/1, websocket_close/2]).
 -export([get_sslsocket/1]).
 -export([new_cookie_session/1, new_cookie_session/2, new_cookie_session/3,
          cookieval_to_opaque/1, request_url/1,
          print_cookie_sessions/0,
-         replace_cookie_session/2, delete_cookie_session/1]).
+         replace_cookie_session/2, replace_cookie_session/3,
+         delete_cookie_session/1]).
 
 -export([getconf/0,
          setconf/2,
@@ -156,30 +157,36 @@ headers_other(#headers{other = X}) -> X.
 
 %% parse the command line query data
 parse_query(Arg) ->
-    D = Arg#arg.querydata,
-    if
-        D == [] ->
-            [];
-        true ->
-            parse_post_data_urlencoded(D)
+    case get(query_parse) of
+        undefined ->
+            Res = case Arg#arg.querydata of
+                      [] -> [];
+                      D  -> parse_post_data_urlencoded(D)
+                  end,
+            put(query_parse, Res),
+            Res;
+        Res ->
+            Res
     end.
 
 %% parse url encoded POST data
 parse_post(Arg) ->
-    D = Arg#arg.clidata,
-    Req = Arg#arg.req,
-    case Req#http_request.method of
-        'POST' ->
-            case D of
-                [] -> [];
-                _ ->
-                    parse_post_data_urlencoded(D)
-            end;
-        Other ->
-            error_logger:error_msg(
-              "ERROR: Can't parse post body for ~p requests: URL: ~p",
-              [Other, Arg#arg.fullpath]),
-            []
+    case get(post_parse) of
+        undefined ->
+            H = Arg#arg.headers,
+            Res = case H#headers.content_type of
+                      "application/x-www-form-urlencoded"++_ ->
+                          case Arg#arg.clidata of
+                              [] -> [];
+                              D  -> parse_post_data_urlencoded(D)
+                          end;
+                      _ ->
+                          []
+                  end,
+            put(post_parse, Res),
+            Res;
+        Res ->
+            Res
     end.
 
 
@@ -244,32 +251,22 @@ parse_multipart_post(Arg) ->
     parse_multipart_post(Arg, [list]).
 parse_multipart_post(Arg, Options) ->
     H = Arg#arg.headers,
-    CT = H#headers.content_type,
-    Req = Arg#arg.req,
-    case Req#http_request.method of
-        'POST' ->
-            case CT of
+    case H#headers.content_type of
+        undefined ->
+            {error, no_content_type};
+        "multipart/form-data"++Line ->
+            case Arg#arg.cont of
+                {cont, Cont} ->
+                    parse_multipart(un_partial(Arg#arg.clidata), {cont, Cont});
                 undefined ->
-                    {error, no_content_type};
-                "multipart/form-data"++Line ->
-                    case Arg#arg.cont of
-                        {cont, Cont} ->
-                            parse_multipart(
-                              un_partial(Arg#arg.clidata),
-                              {cont, Cont});
-                        undefined ->
-                            LineArgs = parse_arg_line(Line),
-                            {value, {_, Boundary}} =
-                                lists:keysearch("boundary", 1, LineArgs),
-                            parse_multipart(
-                              un_partial(Arg#arg.clidata),
-                              Boundary, Options)
-                    end;
-                _Other ->
-                    {error, no_multipart_form_data}
+                    LineArgs = parse_arg_line(Line),
+                    {value, {_, Boundary}} = lists:keysearch("boundary", 1,
+                                                             LineArgs),
+                    parse_multipart(un_partial(Arg#arg.clidata),
+                                    Boundary, Options)
             end;
         _Other ->
-            {error, bad_method}
+            {error, no_multipart_form_data}
     end.
 
 un_partial({partial, Bin}) ->
@@ -337,6 +334,7 @@ make_parse_line_reply(Key, Value, Rest) ->
 -record(mp_parse_state, {
           state,
           boundary_ctx,
+          boundary_len,
           hdr_end_ctx,
           old_data,
           data_type
@@ -354,7 +352,7 @@ parse_multipart(Data, St, Options) ->
 
 parse_multi(Data, #mp_parse_state{state=boundary}=ParseState, Acc) ->
     %% Find the beginning of the next part or the last boundary
-    case bm_find(Data, ParseState#mp_parse_state.boundary_ctx) of
+    case binary:match(Data, ParseState#mp_parse_state.boundary_ctx) of
         {Pos, Len} ->
             %% If Pos != 0, ignore data preceding the boundary
             case Data of
@@ -378,7 +376,7 @@ parse_multi(Data, #mp_parse_state{state=boundary}=ParseState, Acc) ->
             %% No boundary found, request more data. Here we keep just enough
             %% data to match on the boundary the next time
             DLen = size(Data),
-            BLen = bm_length(ParseState#mp_parse_state.boundary_ctx),
+            BLen = ParseState#mp_parse_state.boundary_len,
             SkipLen = erlang:max(DLen - BLen, 0),
             KeepLen = erlang:min(BLen, DLen),
             <<_:SkipLen/binary, OldData:KeepLen/binary>> = Data,
@@ -390,7 +388,7 @@ parse_multi(Data, #mp_parse_state{state=start_headers}=ParseState, Acc) ->
 
 parse_multi(Data, #mp_parse_state{state=body}=ParseState, Acc) ->
     %% Find the end of this part (i.e the next boundary)
-    case bm_find(Data, ParseState#mp_parse_state.boundary_ctx) of
+    case binary:match(Data, ParseState#mp_parse_state.boundary_ctx) of
         {Pos, _Len} ->
             %% Extract the body and keep the boundary
             <<Body:Pos/binary, Rest/binary>> = Data,
@@ -404,7 +402,7 @@ parse_multi(Data, #mp_parse_state{state=body}=ParseState, Acc) ->
         nomatch ->
             %% No boundary found, request more data.
             DLen = size(Data),
-            BLen = bm_length(ParseState#mp_parse_state.boundary_ctx),
+            BLen = ParseState#mp_parse_state.boundary_len,
             SkipLen = erlang:max(DLen - BLen, 0),
             KeepLen = erlang:min(BLen, DLen),
             <<PartData:SkipLen/binary, OldData:KeepLen/binary>> = Data,
@@ -424,15 +422,17 @@ parse_multi(Data, {cont, #mp_parse_state{old_data=OldData}=ParseState}, _) ->
 
 parse_multi(Data, Boundary, Options) ->
     %% Initial entry point
-    BoundaryCtx = bm_start("\r\n--"++Boundary),
-    HdrEndCtx   = bm_start("\r\n\r\n"),
-    DataType    = lists:foldl(fun(_,      list)      -> list;
-                                 (list,   _)         -> list;
-                                 (binary, undefined) -> binary;
-                                 (_,      Acc)       -> Acc
-                              end, undefined, Options),
+    FullBoundary = list_to_binary(["\r\n--", Boundary]),
+    BoundaryCtx  = binary:compile_pattern(FullBoundary),
+    HdrEndCtx    = binary:compile_pattern(<<"\r\n\r\n">>),
+    DataType     = lists:foldl(fun(_,      list)      -> list;
+				  (list,   _)         -> list;
+				  (binary, undefined) -> binary;
+				  (_,      Acc)       -> Acc
+			       end, undefined, Options),
     ParseState = #mp_parse_state{state        = boundary,
                                  boundary_ctx = BoundaryCtx,
+                                 boundary_len = size(FullBoundary),
                                  hdr_end_ctx  = HdrEndCtx,
                                  data_type    = DataType},
     parse_multi(<<"\r\n", Data/binary>>, ParseState, []).
@@ -441,7 +441,7 @@ parse_multi(Data, Boundary, Options) ->
 parse_multi(Data, #mp_parse_state{state=start_headers}=ParseState,
             Acc, [], []) ->
     %% Find the end of headers for this part
-    case bm_find(Data, ParseState#mp_parse_state.hdr_end_ctx) of
+    case binary:match(Data, ParseState#mp_parse_state.hdr_end_ctx) of
         {_Pos, _Len} ->
             %% We have all headers, we can parse it
             NParseState = ParseState#mp_parse_state{state=headers},
@@ -583,6 +583,7 @@ code_to_phrase(426) -> "Upgrade Required";
 code_to_phrase(428) -> "Precondition Required";
 code_to_phrase(429) -> "Too Many Requests";
 code_to_phrase(431) -> "Request Header Fields Too Large";
+code_to_phrase(451) -> "Unavailable For Legal Reasons";
 code_to_phrase(500) -> "Internal Server Error";
 code_to_phrase(501) -> "Not Implemented";
 code_to_phrase(502) -> "Bad Gateway";
@@ -601,7 +602,6 @@ code_to_phrase(511) -> "Network Authentication Required";
 %% sticking with the HTTP status codes above for maximal portability and
 %% interoperability.
 %%
-code_to_phrase(451) -> "Requested Action Aborted";   % from FTP (RFC 959)
 code_to_phrase(452) -> "Insufficient Storage Space"; % from FTP (RFC 959)
 code_to_phrase(453) -> "Not Enough Bandwidth".       % from RTSP (RFC 2326)
 
@@ -695,7 +695,7 @@ htmlize_l([X|Tail], Ack) when is_list(X) ->
 
 
 secs() ->
-    {MS, S, _} = now(),
+    {MS, S, _} = yaws:get_time_tuple(),
     (MS * 1000000) + S.
 
 cookie_option(secure) ->
@@ -781,10 +781,14 @@ find_cookie_val2(Name, [Cookie|Rest]) ->
         false                    -> find_cookie_val2(Name, Rest)
     end.
 
+
 %%
 url_decode(Path) ->
+    url_decode_with_encoding(Path, file:native_name_encoding()).
+
+url_decode_with_encoding(Path, Encoding) ->
     {DecPath, QS} = url_decode(Path, []),
-    DecPath1 = case file:native_name_encoding() of
+    DecPath1 = case Encoding of
                    latin1 ->
                        DecPath;
                    utf8 ->
@@ -874,32 +878,28 @@ url_decode_q_split([], Ack) ->
     {path_norm_reverse(Ack), []}.
 
 
+url_encode(URL) when is_list(URL) ->
+    Bin = case file:native_name_encoding() of
+              latin1 -> list_to_binary(URL);
+              utf8   -> unicode:characters_to_binary(URL)
+          end,
+    %% ReservedChars = "!*'();:@&=+$,/?%#[]",
+    UnreservedChars = sets:from_list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                     "abcdefghijklmnopqrstuvwxyz"
+                                     "0123456789-_.~"),
+    flatten([url_encode_byte(Byte, UnreservedChars) || <<Byte>> <= Bin]).
 
-url_encode([H|T]) when is_list(H) ->
-    [url_encode(H) | url_encode(T)];
-url_encode([H|T]) ->
-    if
-        H >= $a, $z >= H ->
-            [H|url_encode(T)];
-        H >= $A, $Z >= H ->
-            [H|url_encode(T)];
-        H >= $0, $9 >= H ->
-            [H|url_encode(T)];
-        H == $_; H == $.; H == $-; H == $/; H == $: -> % FIXME: more..
-            [H|url_encode(T)];
-        true ->
-            case yaws:integer_to_hex(H) of
-                [X, Y] ->
-                    [$%, X, Y | url_encode(T)];
-                [X] ->
-                    [$%, $0, X | url_encode(T)]
+url_encode_byte($:, _) -> $:;  % FIXME: both : and / should be encoded, but
+url_encode_byte($/, _) -> $/;  % too much code currently assumes they're not
+url_encode_byte(Byte, UnreservedChars) ->
+    case sets:is_element(Byte, UnreservedChars) of
+        true -> Byte;
+        false ->
+            case yaws:integer_to_hex(Byte) of
+                [X, Y] -> [$%, X, Y];
+                [X]    -> [$%, $0, X]
             end
-     end;
-
-url_encode([]) ->
-    [].
-
-
+    end.
 
 redirect(Url) -> [{redirect, Url}].
 
@@ -1014,11 +1014,24 @@ stream_process_end(Sock, YawsPid) ->
     YawsPid ! endofstreamcontent.
 
 
-%% Pid must the the process in control of the websocket connection.
-websocket_send(Pid, {Type, Data}) ->
+websocket_send(#ws_state{}=WSState, {Type, Data}) ->
+    yaws_websockets:send(WSState, {Type, Data});
+websocket_send(#ws_state{}=WSState, #ws_frame{}=Frame) ->
+    yaws_websockets:send(WSState, Frame);
+%% Pid must be the process in control of the websocket connection.
+websocket_send(Pid, {Type, Data}) when is_pid(Pid) ->
     yaws_websockets:send(Pid, {Type, Data});
-websocket_send(Pid, #ws_frame{}=Frame) ->
+websocket_send(Pid, #ws_frame{}=Frame) when is_pid(Pid) ->
     yaws_websockets:send(Pid, Frame).
+
+websocket_close(#ws_state{}=WSState) ->
+    yaws_websockets:close(WSState, normal);
+websocket_close(Pid) when is_pid(Pid) ->
+    yaws_websockets:close(Pid, normal).
+websocket_close(#ws_state{}=WSState, Reason) ->
+    yaws_websockets:close(WSState, Reason);
+websocket_close(Pid, Reason) when is_pid(Pid) ->
+    yaws_websockets:close(Pid, Reason).
 
 
 %% returns {ok, SSL socket} if an SSL socket, undefined otherwise
@@ -1046,6 +1059,8 @@ print_cookie_sessions() ->
 
 replace_cookie_session(Cookie, NewOpaque) ->
     yaws_session_server:replace_session(Cookie, NewOpaque).
+replace_cookie_session(Cookie, NewOpaque, Cleanup) ->
+    yaws_session_server:replace_session(Cookie, NewOpaque, Cleanup).
 
 delete_cookie_session(Cookie) ->
     yaws_session_server:delete_session(Cookie).
@@ -1724,12 +1739,13 @@ is_abs_URI1(_) ->
 %% ------------------------------------------------------------
 %% simple erlang term representation of HTML:
 %% EHTML = [EHTML] | {Tag, Attrs, Body} | {Tag, Attrs} | {Tag} |
-%%         {Module, Fun, [Args]} | fun/0
+%%         {Module, Fun, [Args]} | fun/0 |
 %%         binary() | character()
 %% Tag   = atom()
-%% Attrs = [{Key, Value}]  or {EventTag, {jscall, FunName, [Args]}}
+%% Attrs = [{Key, Value}]
 %% Key   = atom()
-%% Value = string() | {Module, Fun, [Args]} | fun/0
+%% Value = string() | binary() | atom() | integer() | float() |
+%%         {Module, Fun, [Args]} | fun/0
 %% Body  = EHTML
 
 ehtml_expand(Ch) when Ch >= 0, Ch =< 255 -> Ch; %yaws_api:htmlize_char(Ch);
@@ -1749,15 +1765,14 @@ ehtml_expand({ssi,File, Del, Bs}) ->
 %% benchmarks folder to measure it.
                                                 %
 ehtml_expand({Tag}) ->
-    ["<", atom_to_list(Tag), " />"];
+    ["<", atom_to_list(Tag), ehtml_end_tag(Tag)];
 ehtml_expand({pre_html, X}) -> X;
 ehtml_expand({Mod, Fun, Args})
   when is_atom(Mod), is_atom(Fun), is_list(Args) ->
     ehtml_expand(Mod:Fun(Args));
 ehtml_expand({Tag, Attrs}) ->
     NL = ehtml_nl(Tag),
-    [NL, "<", atom_to_list(Tag), ehtml_attrs(Attrs), "></",
-     atom_to_list(Tag), ">"];
+    [NL, "<", atom_to_list(Tag), ehtml_attrs(Attrs), ehtml_end_tag(Tag)];
 ehtml_expand({Tag, Attrs, Body}) when is_atom(Tag) ->
     Ts = atom_to_list(Tag),
     NL = ehtml_nl(Tag),
@@ -1779,12 +1794,7 @@ ehtml_attrs([{Name, {Mod, Fun, Args}} | Tail])
 ehtml_attrs([{Name, Value} | Tail]) when is_function(Value) ->
     ehtml_attrs([{Name, Value()} | Tail]);
 ehtml_attrs([{Name, Value} | Tail]) ->
-    ValueString = [$", if
-                           is_atom(Value) -> atom_to_list(Value);
-                           is_list(Value) -> Value;
-                           is_integer(Value) -> integer_to_list(Value);
-                           is_float(Value) -> float_to_list(Value)
-                       end, $"],
+    ValueString = [$", value2string(Value), $"],
     [[$ |atom_to_list(Name)], [$=|ValueString]|ehtml_attrs(Tail)];
 ehtml_attrs([{check, Name, {Mod, Fun, Args}} | Tail])
   when is_atom(Mod), is_atom(Fun), is_list(Args) ->
@@ -1792,18 +1802,19 @@ ehtml_attrs([{check, Name, {Mod, Fun, Args}} | Tail])
 ehtml_attrs([{check, Name, Value} | Tail]) when is_function(Value) ->
     ehtml_attrs([{check, Name, Value()} | Tail]);
 ehtml_attrs([{check, Name, Value} | Tail]) ->
-    Val = if
-              is_atom(Value) -> atom_to_list(Value);
-              is_list(Value) -> Value;
-              is_integer(Value) -> integer_to_list(Value);
-              is_float(Value) -> float_to_list(Value)
-          end,
+    Val = value2string(Value),
     Q = case deepmember($", Val) of
             true -> $';
             false -> $"
         end,
-    ValueString = [Q,Value,Q],
+    ValueString = [Q,Val,Q],
     [[$ |atom_to_list(Name)], [$=|ValueString]|ehtml_attrs(Tail)].
+
+value2string(Atom) when is_atom(Atom) -> atom_to_list(Atom);
+value2string(String) when is_list(String) -> String;
+value2string(Binary) when is_binary(Binary) -> Binary;
+value2string(Integer) when is_integer(Integer) -> integer_to_list(Integer);
+value2string(Float) when is_float(Float) -> float_to_list(Float).
 
 
 
@@ -1845,6 +1856,30 @@ ehtml_nl(object) -> [];
 ehtml_nl(_) -> "\n".
 
 
+%% Void elements must not have an end tag (</tag>) in HTML5, while for most
+%% elements a proper end tag (<tag></tag>, not <tag />) is mandatory.
+%%
+%% http://www.w3.org/TR/html5/syntax.html#void-elements
+%% http://www.w3.org/TR/html5/syntax.html#syntax-tag-omission
+
+-define(self_closing, " />"). % slash ignored in HTML5
+
+ehtml_end_tag(area) -> ?self_closing;
+ehtml_end_tag(base) -> ?self_closing;
+ehtml_end_tag(br) -> ?self_closing;
+ehtml_end_tag(col) -> ?self_closing;
+ehtml_end_tag(embed) -> ?self_closing;
+ehtml_end_tag(hr) -> ?self_closing;
+ehtml_end_tag(img) -> ?self_closing;
+ehtml_end_tag(input) -> ?self_closing;
+ehtml_end_tag(keygen) -> ?self_closing;
+ehtml_end_tag(link) -> ?self_closing;
+ehtml_end_tag(meta) -> ?self_closing;
+ehtml_end_tag(param) -> ?self_closing;
+ehtml_end_tag(source) -> ?self_closing;
+ehtml_end_tag(track) -> ?self_closing;
+ehtml_end_tag(wbr) -> ?self_closing;
+ehtml_end_tag(Tag) -> ["></", atom_to_list(Tag), ">"].
 
 
 %% ------------------------------------------------------------
@@ -1901,11 +1936,12 @@ ehtml_expander({pre_html, X}, Before, After) ->
     ehtml_expander_done(X, Before, After);
 %% Tags
 ehtml_expander({Tag}, Before, After) ->
-    ehtml_expander_done(["<", atom_to_list(Tag), " />"], Before, After);
+    ehtml_expander_done(["<", atom_to_list(Tag), ehtml_end_tag(Tag)],
+                        Before, After);
 ehtml_expander({Tag, Attrs}, Before, After) ->
     NL = ehtml_nl(Tag),
-    ehtml_expander_done([NL, "<", atom_to_list(Tag), ehtml_attrs(Attrs), "></",
-                         atom_to_list(Tag), ">"],
+    ehtml_expander_done([NL, "<", atom_to_list(Tag), ehtml_attrs(Attrs),
+                         ehtml_end_tag(Tag)],
                         Before,
                         After);
 ehtml_expander({Tag, Attrs, Body}, Before, After) ->
@@ -2061,10 +2097,11 @@ call_cgi(Arg, Exefilename, Scriptfilename) ->
 %%
 %% {app_server_port, int()} : The TCP port number of the application server.
 %%
-%% {path_info, string()} : Override the patinfo string from Arg.
+%% {path_info, string()} : Override the pathinfo string from Arg.
 %%
-%% {extra_env, [{string(), string()}]} : Extra environment variables to be
-%% passed to the application server, as a list of name-value pairs.
+%% {extra_env, [{string()|binary(), string()|binary()}]} : Extra
+%% environment variables to be passed to the application server, as a list
+%% of name-value pairs.
 %%
 %% trace_protocol : Trace FastCGI protocol messages.
 %%
@@ -2095,6 +2132,12 @@ deepmember(C,[L|Cs]) when is_list(L) ->
         false -> deepmember(C,Cs)
     end;
 deepmember(C,[N|Cs]) when C /= N ->
+    deepmember(C, Cs);
+deepmember(_C,<<>>) ->
+    false;
+deepmember(C, <<C,_Cs/binary>>) ->
+    true;
+deepmember(C, <<_,Cs/binary>>) ->
     deepmember(C, Cs).
 
 
@@ -2457,53 +2500,27 @@ skip_space(T)           -> T.
 getvar(ARG,Key) when is_atom(Key) ->
     getvar(ARG, atom_to_list(Key));
 getvar(ARG,Key) ->
-    case (ARG#arg.req)#http_request.method of
-        'POST' -> postvar(ARG, Key);
-        'GET' -> queryvar(ARG, Key);
-        _ -> undefined
-    end.
+    filter_parse(Key, yaws_api:parse_query(ARG), yaws_api:parse_post(ARG)).
 
 
 queryvar(ARG,Key) when is_atom(Key) ->
     queryvar(ARG, atom_to_list(Key));
 queryvar(ARG, Key) ->
-    Parse = case get(query_parse) of
-                undefined ->
-                    Pval = yaws_api:parse_query(ARG),
-                    put(query_parse, Pval),
-                    Pval;
-                Val0 ->
-                    Val0
-            end,
-    filter_parse(Key, Parse).
+    filter_parse(Key, yaws_api:parse_query(ARG), []).
 
 postvar(ARG, Key) when is_atom(Key) ->
     postvar(ARG, atom_to_list(Key));
 postvar(ARG, Key) ->
-    Parse = case get(post_parse) of
-                undefined ->
-                    Pval = yaws_api:parse_post(ARG),
-                    put(post_parse, Pval),
-                    Pval;
-                Val0 ->
-                    Val0
-            end,
-    filter_parse(Key, Parse).
+    filter_parse(Key, [], yaws_api:parse_post(ARG)).
 
-filter_parse(Key, Parse) ->
-    case lists:filter(fun(KV) ->
-                              (Key == element(1, KV))
-                                  andalso
-                                    (element(2, KV) /= undefined)
-                      end,
-                      Parse) of
+filter_parse(Key, QueryParse, PostParse) ->
+    Fun = fun({K,V}) -> (Key == K andalso V /= undefined) end,
+    Values = lists:filter(Fun, QueryParse) ++ lists:filter(Fun, PostParse),
+    case Values of
         [] -> undefined;
         [{_, V}] -> {ok,V};
         %% Multivalued case - return list of values
-        Vs -> list_to_tuple(lists:map(fun(KV) ->
-                                              element(2, KV)
-                                      end,
-                                      Vs))
+        _  -> list_to_tuple(lists:map(fun({_,V}) -> V end, Values))
     end.
 
 
@@ -2598,7 +2615,7 @@ setconf(GC0, Groups0, CheckCertsChanged) ->
         {true, true} ->
             yaws_config:soft_setconf(GC, Groups2, OLDGC, OldGroups);
         {true, false} ->
-            yaws_config:hard_setconf(GC, Groups2);
+            ok = yaws_config:hard_setconf(GC, Groups2);
         _ ->
             {error, need_restart}
     end.
@@ -2710,39 +2727,3 @@ redirect_self(A) ->
                 scheme_str = SchemeStr,
                 port = Port,
                 port_str = PortStr}.
-
-%% Boyer-Moore searching, used for parsing multipart/form-data
-bm_start(Str) ->
-    Len = length(Str),
-    Tbl = bm_set_shifts(Str, Len),
-    {Tbl, list_to_binary(Str), lists:reverse(Str), Len}.
-
-bm_length({_,_,_,Len}) ->
-    Len.
-
-bm_find(Bin, SearchCtx) ->
-    bm_find(Bin, SearchCtx, 0).
-bm_find(Bin, {_, _, _, Len}, Pos) when size(Bin) < (Pos + Len) ->
-    nomatch;
-bm_find(Bin, {Tbl, BStr, RevStr, Len}=SearchCtx, Pos) ->
-    case Bin of
-        <<_:Pos/binary, BStr:Len/binary, _/binary>> ->
-            {Pos, Len};
-        <<_:Pos/binary, NoMatch:Len/binary, _/binary>> ->
-            RevNoMatch = lists:reverse(binary_to_list(NoMatch)),
-            Shift = bm_next_shift(RevNoMatch, RevStr, 0, Tbl),
-            bm_find(Bin, SearchCtx, Pos+Shift)
-    end.
-
-bm_set_shifts(Str, Len) ->
-    erlang:make_tuple(256, Len, bm_set_shifts(Str, 0, Len, [])).
-bm_set_shifts(_Str, Count, Len, Acc) when Count =:= Len-1 ->
-    lists:reverse(Acc);
-bm_set_shifts([H|T], Count, Len, Acc) ->
-    Shift = Len - Count - 1,
-    bm_set_shifts(T, Count+1, Len, [{H+1,Shift}|Acc]).
-
-bm_next_shift([H|T1], [H|T2], Comparisons, Tbl) ->
-    bm_next_shift(T1, T2, Comparisons+1, Tbl);
-bm_next_shift([H|_], _, Comparisons, Tbl) ->
-    erlang:max(element(H+1, Tbl) - Comparisons, 1).

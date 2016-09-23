@@ -1,4 +1,4 @@
-%    -*- Erlang -*-
+%    -*- coding: utf-8 -*-
 %    File:        wiki.erl  (~jb/work/wiki/src/wiki.erl)
 %    Author:    Joe Armstrong
 %    Author:        Johan Bevemyr
@@ -1610,11 +1610,6 @@ nextSlide(Index, Direction, Page, Root, Prefix) ->
                                  "\">"];
                            true -> []
                         end,
-                    F1 = add_blanks_nicely(Page),
-                    _TopHeader =
-                        ["<a href='showPage.yaws?node=",
-                         str2urlencoded(Page),
-                         "'>",yaws_api:htmlize(F1),"</a>\n"],
                     Locked = Pwd /= "",
                     _Link =
                         wiki_templates:template(Page, Root,
@@ -1642,10 +1637,6 @@ thumbIndex(Params, Root, Prefix) ->
                 ["<table>",
                  build_thumb_table(Pics, Node, Prefix, Root, FileDir),
                  "</table>"],
-            F1 = add_blanks_nicely(Page),
-            _TopHeader =
-                ["<a href='showPage.yaws?node=",Node,"'>",
-                 yaws_api:htmlize(F1),"</a>\n"],
             Locked = Pwd /= "",
             _Link =
                 wiki_templates:template(Page, Root, DeepStr,
@@ -1966,7 +1957,7 @@ open_tmp_file(RootName, Suffix) ->
 open_tmp_file(0, _, Suffix) ->
     exit({cannot_open_a_temporay_file, Suffix});
 open_tmp_file(N, RootName, Suffix) ->
-    {_,_,M} = erlang:now(),
+    {_,_,M} = yaws:get_time_tuple(),
     FileName = RootName ++ "/" ++ integer_to_list(M) ++ Suffix,
     %% io:format("trying to open:~p~n", [FileName]),
     case file:open(FileName, write) of
@@ -2126,15 +2117,15 @@ add_blanks_nicely([]) ->
 
 
 big_letter(H) when $A =< H, H =< $Z -> true;
-big_letter($Å) -> true;
-big_letter($Ä) -> true;
-big_letter($Ö) -> true;
+big_letter($Ã…) -> true;
+big_letter($Ã„) -> true;
+big_letter($Ã–) -> true;
 big_letter(_)  -> false.
 
 little_letter(H) when $a =< H, H =< $z -> true;
-little_letter($å) -> true;
-little_letter($ä) -> true;
-little_letter($ö) -> true;
+little_letter($Ã¥) -> true;
+little_letter($Ã¤) -> true;
+little_letter($Ã¶) -> true;
 little_letter(_)  -> false.
 
 show({bad_password, Page}, Root) ->
